@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-WiFi and Bluetooth scanner for ESP32-C5 that:
+**SignalScout** - WiFi and Bluetooth scanner for ESP32-C5 that:
 - Scans WiFi networks on both 2.4GHz and 5GHz bands
 - Scans Bluetooth Low Energy (BLE) devices
 - GPS-timestamped logging with location data

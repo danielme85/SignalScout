@@ -1,5 +1,5 @@
 /*
- * WiFi and Bluetooth Scanner for ESP32-C5
+ * SignalScout - WiFi and Bluetooth Scanner for ESP32-C5
  * Scans 2.4GHz and 5GHz WiFi networks and Bluetooth devices
  * Logs all activity to SD card over SPI with GPS timestamps and location
  * Displays status on SSD1309 OLED display
@@ -89,8 +89,8 @@ void setup() {
   delay(1000);
 
   if (ENABLE_CONSOLE_OUTPUT) {
-    Serial.println("ESP32-C5 WiFi & Bluetooth Scanner with GPS");
-    Serial.println("===========================================");
+    Serial.println("SignalScout - WiFi & Bluetooth Scanner with GPS");
+    Serial.println("================================================");
   }
 
   // Initialize OLED Display
@@ -126,7 +126,7 @@ void setup() {
     }
 
     if (ENABLE_CONSOLE_OUTPUT) Serial.println("SD Card initialized successfully");
-    logToFile("System started - ESP32-C5 Scanner initialized");
+    logToFile("System started - SignalScout initialized");
   }
 
   // Set WiFi to station mode
@@ -136,7 +136,7 @@ void setup() {
 
   // Initialize BLE
   if (ENABLE_CONSOLE_OUTPUT) Serial.println("Initializing BLE...");
-  BLEDevice::init("ESP32-C5-Scanner");
+  BLEDevice::init("SignalScout");
   pBLEScan = BLEDevice::getScan();
   pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
   pBLEScan->setActiveScan(true);
