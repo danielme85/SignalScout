@@ -1,3 +1,5 @@
+> **Disclaimer:** This project and code was written by Claude (Claude Sonnet 4.5). All design, implementation, and documentation were AI-generated to create a functional wireless scanning and GPS logging device.
+
 # SignalScout 📡
 
 **A portable WiFi and Bluetooth scanner with GPS tracking for ESP32-C5**
