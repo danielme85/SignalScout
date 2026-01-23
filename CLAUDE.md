@@ -54,6 +54,8 @@ The sketch is structured around five main components:
    - Provides accurate UTC timestamps for all log entries
    - Captures location (lat/lon), altitude/elevation, satellite count, and HDOP
    - Updates `gpsTimeValid` flag when GPS achieves time lock
+   - Syncs ESP32 RTC from GPS time (updates every 60 seconds for accuracy)
+   - RTC time persists across reboots, allowing immediate time availability on boot
 
 4. **OLED Display** (`updateDisplay()` function):
    - Updates every 500ms with real-time GPS and system status
@@ -72,18 +74,21 @@ The sketch is structured around five main components:
    - Fingerprints used for device identification and tracking
 
 6. **SD Card Logger** (`logDeviceToFile()` and `logToFile()` functions):
+   - Creates unique log file on each boot with timestamp in filename
+   - Filename format: `/scan_YYYYMMDD_HHMMSS.txt` (using RTC time) or `/scan_boot_XXXXX.txt` (using millis if no RTC)
    - Each device logged on one line with complete GPS data
    - Format: `TYPE,Fingerprint,Timestamp,Lat,Lon,Alt,Sats,HDOP,DeviceParams...`
    - WiFi format: `WIFI,FP,Time,Lat,Lon,Alt,Sats,HDOP,SSID,BSSID,RSSI,Ch,Band,Enc`
    - BLE format: `BLE,FP,Time,Lat,Lon,Alt,Sats,HDOP,Name,Addr,RSSI,ManufData,ServiceUUID`
    - GPS data included with every device entry for location tracking
+   - Falls back to RTC time when GPS not available (marked with "(RTC)" suffix)
 
 ## Configuration
 
 Key settings defined at the top of the sketch:
 
-- **Output Flags** (WifiScanner.ino:49-51):
-  - `ENABLE_CONSOLE_OUTPUT`: Enable/disable serial console output (default: true)
+- **Output Flags** (WifiScanner.ino:51-53):
+  - `ENABLE_CONSOLE_OUTPUT`: Enable/disable serial console output (default: true). Set to `false` in production to save processing time.
   - `ENABLE_DISPLAY_OUTPUT`: Enable/disable OLED display (default: true)
   - `ENABLE_LOG_OUTPUT`: Enable/disable SD card logging (default: true)
 
@@ -152,6 +157,7 @@ External libraries required (install via Library Manager):
 - `TinyGPSPlus` - GPS NMEA/UBLOX sentence parsing
 - `Adafruit GFX Library` - Graphics library for OLED display
 - `Adafruit SSD1306` - OLED display driver (compatible with SSD1309)
+- `ESP32Time` - RTC time management for ESP32 (persists time across reboots)
 
 To install libraries:
 ```bash
@@ -159,6 +165,7 @@ To install libraries:
 arduino-cli lib install "TinyGPSPlus"
 arduino-cli lib install "Adafruit GFX Library"
 arduino-cli lib install "Adafruit SSD1306"
+arduino-cli lib install "ESP32Time"
 
 # Or in Arduino IDE: Tools > Manage Libraries > Search for each library name
 ```
@@ -184,10 +191,16 @@ The display provides real-time visual feedback:
 - Serial monitor will display "GPS time lock acquired!" when ready
 - GPS information is displayed showing location, altitude, satellites, and HDOP
 - Display will show satellite count in top-left corner with signal bars
+- Once GPS time is acquired, it syncs to the ESP32 RTC for persistent timekeeping
+- On subsequent boots, RTC time is available immediately (no GPS wait required for timestamps)
 
 **Log File Format:**
 
-The SD card log file (`/scanner_log.txt`) contains one line per device with complete GPS data.
+Each boot creates a unique log file with timestamp in the filename:
+- With RTC time: `/scan_YYYYMMDD_HHMMSS.txt` (e.g., `/scan_20260121_153045.txt`)
+- Without RTC time: `/scan_boot_XXXXX.txt` (e.g., `/scan_boot_1234.txt`)
+
+Each file contains one line per device with complete GPS data.
 
 **WiFi Entry Format:**
 ```
@@ -202,7 +215,8 @@ BLE,XXXXXXXX,YYYY-MM-DD HH:MM:SS,Lat,Lon,Alt,Sats,HDOP,Name,Address,RSSI,ManufDa
 Where:
 - `XXXXXXXX` = 8-character hexadecimal device fingerprint
 - GPS coordinates, altitude, satellite count, and HDOP included with every device
-- When GPS fix unavailable, timestamp shows milliseconds and GPS fields show "N/A"
+- When GPS fix unavailable but RTC time exists, timestamp shows RTC time with "(RTC)" suffix
+- When neither GPS nor RTC available, timestamp shows milliseconds and GPS fields show "N/A"
 
 **Example WiFi Entry:**
 ```
