@@ -70,7 +70,7 @@
 #define VOLTAGE_DIVIDER_RATIO 3.3  // Adjust based on your voltage divider
 
 // Scan settings
-#define SCAN_INTERVAL 5000  // WiFi, BLE, and Zigbee scan every 5 seconds
+#define SCAN_INTERVAL 1  // WiFi, BLE, and Zigbee scan every second
 #define BLE_SCAN_TIME 2      // BLE scan duration in seconds
 #define ZIGBEE_SCAN_DURATION 2  // Zigbee scan duration (1-14, higher = longer)
 
