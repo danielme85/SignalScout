@@ -70,20 +70,20 @@
 #define VOLTAGE_DIVIDER_RATIO 3.3  // Adjust based on your voltage divider
 
 // Scan settings
-#define SCAN_INTERVAL 10000  // WiFi, BLE, and Zigbee scan every 10 seconds
-#define BLE_SCAN_TIME 5      // BLE scan duration in seconds
-#define ZIGBEE_SCAN_DURATION 5  // Zigbee scan duration (1-14, higher = longer)
+#define SCAN_INTERVAL 5000  // WiFi, BLE, and Zigbee scan every 5 seconds
+#define BLE_SCAN_TIME 2      // BLE scan duration in seconds
+#define ZIGBEE_SCAN_DURATION 2  // Zigbee scan duration (1-14, higher = longer)
 
 // Zigbee settings
 // Note: Requires Arduino IDE settings:
-//   Tools -> Zigbee Mode -> Zigbee ED (End Device) [recommended for scanning]
+//   Tools -> Zigbee Mode -> Zigbee ZCZR (Coordinator/Router) [required for scanning]
 //   Tools -> Partition Scheme -> Zigbee 4MB with spiffs (or appropriate for your flash size)
-// ED (End Device) mode is recommended for passive scanning - lower power consumption
-// ZCZR (Coordinator/Router) mode can also scan but uses more power
+// ZCZR (Coordinator/Router) mode is required for network scanning
+// The "Network steering was not successful" warning is normal and can be ignored
 #define ENABLE_ZIGBEE_SCAN true  // Enable/disable Zigbee scanning
 
 // Output enable/disable flags
-#define ENABLE_CONSOLE_OUTPUT true   // Enable/disable serial console output
+#define ENABLE_CONSOLE_OUTPUT false   // Enable/disable serial console output
 #define ENABLE_DISPLAY_OUTPUT true   // Enable/disable OLED display output
 #define ENABLE_LOG_OUTPUT true       // Enable/disable SD card logging
 
@@ -120,6 +120,9 @@ bool rtcSyncedFromGPS = false;  // Track if RTC has been synced from GPS this se
 // Dynamic log filename (generated at boot with timestamp)
 String logFileName;
 
+// SD card mount status
+bool sdCardMounted = false;
+
 // OLED Display
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, OLED_MOSI, OLED_CLK, OLED_DC, OLED_RESET, OLED_CS);
 
@@ -130,6 +133,9 @@ Adafruit_NeoPixel statusLED(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
 int batteryPercent = 0;
 unsigned long lastBatteryRead = 0;
 #define BATTERY_READ_INTERVAL 5000  // Read battery every 5 seconds
+
+// WiFi logo animation state (0 = dot only, 1-3 = number of rings)
+int wifiAnimationState = 0;
 
 BLEScan* pBLEScan;
 
@@ -150,7 +156,6 @@ void consolePrint(const char* msg) {
 void consolePrintln(const char* msg) {
   if (ENABLE_CONSOLE_OUTPUT) {
     Serial.println(msg);
-    Serial.flush();
   }
 }
 
@@ -162,7 +167,6 @@ void consolePrintf(const char* format, ...) {
     vsnprintf(buffer, sizeof(buffer), format, args);
     va_end(args);
     Serial.print(buffer);
-    Serial.flush();
   }
 }
 
@@ -244,33 +248,78 @@ void setup() {
 
   // Initialize status LED first
   statusLED.begin();
-  statusLED.setBrightness(200);  // Set brightness (0-255)
+  statusLED.setBrightness(100);  // Set brightness (0-255)
   ledInitializing();  // Red: Starting initialization
 
   consolePrintln("\n\n=== BOOT START ===");
-  consolePrintln("SignalScout - WiFi & Bluetooth Scanner with GPS");
-  consolePrintln("================================================");
+  consolePrintln("SignalScout - WiFi, Bluetooth & Zigbee Scanner with GPS");
+  consolePrintln("=========================================================");
+
+  // ============================================
+  // CRITICAL: Initialize SD card FIRST before any radio initialization
+  // The Zigbee/BLE radios can interfere with SPI if initialized first
+  // ============================================
+  consolePrintln("\n[1/7] Initializing SD card (SPI)...");
+  if (ENABLE_LOG_OUTPUT) {
+    // Initialize SPI bus for SD card
+    SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+    delay(100);  // Allow SPI to stabilize
+
+    // Try to mount SD card with retries
+    int retries = 3;
+    while (retries > 0 && !sdCardMounted) {
+      if (SD.begin(SD_CS, SPI, 4000000)) {  // 4MHz SPI speed for compatibility
+        sdCardMounted = true;
+        consolePrintln("SD Card mounted successfully");
+
+        // Verify we can actually write to the card
+        File testFile = SD.open("/test.tmp", FILE_WRITE);
+        if (testFile) {
+          testFile.println("test");
+          testFile.close();
+          SD.remove("/test.tmp");
+          consolePrintln("SD Card write test passed");
+        } else {
+          consolePrintln("WARNING: SD Card write test failed");
+          sdCardMounted = false;
+        }
+      } else {
+        retries--;
+        if (retries > 0) {
+          consolePrintf("SD Card mount failed, retrying... (%d attempts left)\n", retries);
+          delay(500);
+        }
+      }
+    }
+
+    if (!sdCardMounted) {
+      consolePrintln("ERROR: SD Card initialization failed after all retries!");
+      consolePrintln("Check: 1) Card inserted? 2) FAT32 format? 3) Wiring correct?");
+      consolePrintln("Continuing without SD logging...");
+    }
+  } else {
+    consolePrintln("SD logging disabled in config");
+  }
 
   // Initialize battery ADC
+  consolePrintln("\n[2/7] Initializing battery monitor...");
   analogReadResolution(12);  // 12-bit resolution
   analogSetAttenuation(ADC_11db);  // Full range 0-3.3V
   batteryPercent = readBatteryPercent();
   consolePrintf("Battery level: %d%%\n", batteryPercent);
 
   // Check RTC time on boot
-  consolePrintln("Checking RTC time...");
+  consolePrintln("\n[3/7] Checking RTC time...");
   if (rtc.getYear() > 2020) {
     consolePrintf("RTC time found: %04d-%02d-%02d %02d:%02d:%02d\n",
                   rtc.getYear(), rtc.getMonth() + 1, rtc.getDay(),
                   rtc.getHour(true), rtc.getMinute(), rtc.getSecond());
-    // RTC has valid time, we can use it immediately for logging
-    // but we still wait for GPS fix before starting scans
   } else {
     consolePrintln("No valid RTC time stored");
   }
 
   // Initialize OLED Display
-  consolePrintln("Initializing OLED display...");
+  consolePrintln("\n[4/7] Initializing OLED display...");
   if (ENABLE_DISPLAY_OUTPUT) {
     if(!display.begin(SSD1306_SWITCHCAPVCC)) {
       consolePrintln("ERROR: SSD1306 allocation failed!");
@@ -289,32 +338,15 @@ void setup() {
   }
 
   // Initialize GPS
-  consolePrintln("Initializing GPS...");
+  consolePrintln("\n[5/7] Initializing GPS...");
   gpsSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX, GPS_TX);
-  consolePrintln("GPS initialized.");
+  consolePrintln("GPS UART initialized");
 
-  // Initialize SD card
-  consolePrintln("Initializing SD card...");
-  if (ENABLE_LOG_OUTPUT) {
-    SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
-    if (!SD.begin(SD_CS)) {
-      consolePrintln("ERROR: SD Card initialization failed!");
-      consolePrintln("Check SD card and wiring. Continuing without SD logging...");
-    } else {
-      consolePrintln("SD Card initialized successfully");
-    }
-  } else {
-    consolePrintln("SD logging disabled in config");
-  }
-
-  // Set WiFi to station mode
-  consolePrintln("Initializing WiFi...");
+  // Initialize WiFi
+  consolePrintln("\n[6/7] Initializing WiFi...");
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
   delay(100);
-
-  // Note: We use ESP-IDF scan APIs directly to support dual-band (2.4GHz + 5GHz) scanning
-  // The Arduino WiFi library has issues with WIFI_BAND_MODE_AUTO on ESP32-C5
   consolePrintln("WiFi initialized (dual-band 2.4GHz + 5GHz mode)");
 
   // Initialize BLE
@@ -327,20 +359,22 @@ void setup() {
   pBLEScan->setWindow(99);
   consolePrintln("BLE initialized");
 
-  // Initialize Zigbee (IEEE 802.15.4)
-  // Note: Requires Arduino IDE settings:
-  //   Tools -> Zigbee Mode -> Zigbee ED (End Device)
-  //   Tools -> Partition Scheme -> Zigbee with appropriate size
+  // Initialize Zigbee LAST (IEEE 802.15.4)
+  // This must be after SD card to prevent SPI conflicts
+  consolePrintln("\n[7/7] Initializing Zigbee (IEEE 802.15.4)...");
   if (ENABLE_ZIGBEE_SCAN) {
-    consolePrintln("Initializing Zigbee (IEEE 802.15.4)...");
-    // Start Zigbee stack in scanning mode (no endpoints needed for scanning)
-    // Using ZIGBEE_END_DEVICE role for passive scanning with lower power
-    if (Zigbee.begin(ZIGBEE_END_DEVICE, false)) {  // false = don't auto-start commissioning
+    // Note: Requires Arduino IDE settings:
+    //   Tools -> Zigbee Mode -> Zigbee ZCZR (Coordinator/Router)
+    //   Tools -> Partition Scheme -> Zigbee 4MB with spiffs
+    // Using ZIGBEE_ROUTER role for network scanning capability
+    Zigbee.setRebootOpenNetwork(0);  // Don't open network on reboot
+    if (Zigbee.begin(ZIGBEE_ROUTER, false)) {
       zigbeeInitialized = true;
-      consolePrintln("Zigbee initialized (ED mode for passive scanning)");
+      consolePrintln("Zigbee initialized (Router mode for scanning)");
+      consolePrintln("Note: 'No Zigbee EPs to register' warning is normal for scanning");
     } else {
       consolePrintln("WARNING: Zigbee initialization failed!");
-      consolePrintln("Check Arduino IDE settings: Zigbee Mode and Partition Scheme");
+      consolePrintln("Check Arduino IDE: Tools -> Zigbee Mode -> Zigbee ZCZR");
     }
   } else {
     consolePrintln("Zigbee scanning disabled in config");
@@ -407,7 +441,7 @@ void setup() {
   consolePrintln("RTC synced from GPS time!");
 
   // Generate log filename now that we have valid time
-  if (ENABLE_LOG_OUTPUT) {
+  if (ENABLE_LOG_OUTPUT && sdCardMounted) {
     generateLogFileName();
     logToFile("System started - SignalScout initialized");
     logToFile("GPS signal acquired");
@@ -416,7 +450,12 @@ void setup() {
   // Setup complete
   ledReady();  // Green: Ready
   consolePrintln("\nInitialization complete. Starting scans...\n");
-  if (ENABLE_LOG_OUTPUT) logToFile("Initialization complete - entering main loop");
+  if (sdCardMounted) {
+    logToFile("Initialization complete - entering main loop");
+    consolePrintf("Logging to: %s\n", logFileName.c_str());
+  } else {
+    consolePrintln("WARNING: SD card not mounted - logging disabled");
+  }
 
   // Brief pause to show green LED
   delay(1000);
@@ -675,7 +714,11 @@ void scanBluetooth() {
 void scanZigbee() {
   consolePrintln("\n--- Zigbee Scan Starting (IEEE 802.15.4) ---");
 
+  // Note: "Network steering was not successful" warning is normal for scanning-only mode
+  // We're not trying to join a network, just scanning for nearby networks
+
   // Start network scan on all Zigbee channels (11-26)
+  // This sends beacon requests and listens for responses
   Zigbee.scanNetworks();
 
   // Wait for scan to complete
@@ -787,7 +830,7 @@ void scanZigbee() {
 
 void logDeviceToFile(String deviceType, String param1, String param2, String param3,
                      String param4, String param5, String param6, String fingerprint) {
-  if (!ENABLE_LOG_OUTPUT) return;
+  if (!ENABLE_LOG_OUTPUT || !sdCardMounted) return;
 
   File logFile = SD.open(logFileName.c_str(), FILE_APPEND);
 
@@ -855,7 +898,7 @@ void logDeviceToFile(String deviceType, String param1, String param2, String par
 }
 
 void logToFile(String message) {
-  if (!ENABLE_LOG_OUTPUT) return;
+  if (!ENABLE_LOG_OUTPUT || !sdCardMounted) return;
 
   File logFile = SD.open(logFileName.c_str(), FILE_APPEND);
 
@@ -1004,24 +1047,11 @@ void updateDisplay(String statusMessage) {
     display.setCursor(2, 38);
     display.printf("Z:%d(%d)", lastZigbeeScanCount, uniqueZigbeeCount);
 
-    // Countdown timer on right side (right-aligned with margin)
-    unsigned long currentTime = millis();
-    unsigned long timeSinceLastScan = currentTime - lastScan;
-    unsigned long timeUntilNextScan = SCAN_INTERVAL - timeSinceLastScan;
-    int secondsLeft = timeUntilNextScan / 1000;
+    // Draw animated WiFi logo in center-right of screen
+    drawWiFiLogo(85, 18);
 
-    display.setTextSize(1);
-    // Right align "Scan in:" - 8 chars * 6px = 48px from right edge (128-48-2=78)
-    display.setCursor(70, 18);
-    display.print("Scan in:");
-
-    display.setTextSize(2);
-    // Right align seconds - estimate width and position from right
-    char secStr[4];
-    snprintf(secStr, sizeof(secStr), "%ds", secondsLeft);
-    int secWidth = strlen(secStr) * 12;  // 12px per char in size 2
-    display.setCursor(SCREEN_WIDTH - secWidth - 2, 30);
-    display.print(secStr);
+    // Advance animation state for next frame
+    wifiAnimationState = (wifiAnimationState + 1) % 4;
   }
 
   // Bottom Left: GPS Time
@@ -1035,9 +1065,9 @@ void updateDisplay(String statusMessage) {
 
 void drawSatelliteIndicator() {
   // Draw satellite icon (simple dish shape)
-  display.drawCircle(6, 6, 4, SSD1306_WHITE);
-  display.drawLine(6, 10, 6, 12, SSD1306_WHITE);
-  display.drawLine(3, 12, 9, 12, SSD1306_WHITE);
+  //display.drawCircle(6, 6, 4, SSD1306_WHITE);
+  //display.drawLine(6, 10, 6, 12, SSD1306_WHITE);
+  //display.drawLine(3, 12, 9, 12, SSD1306_WHITE);
 
   // Draw signal bars based on satellite count
   int satCount = 0;
@@ -1057,7 +1087,7 @@ void drawSatelliteIndicator() {
   else if (satCount >= 1) activeBars = 1;
 
   for (int i = 0; i < maxBars; i++) {
-    int x = 14 + (i * 4);
+    int x = 20 + (i * 4);
     int y = 12 - barHeight[i];
     if (i < activeBars) {
       display.fillRect(x, y, 3, barHeight[i], SSD1306_WHITE);
@@ -1068,9 +1098,9 @@ void drawSatelliteIndicator() {
 
   // Display satellite count
   display.setTextSize(1);
-  display.setCursor(14, 0);
+  display.setCursor(2, 0);
   if (gps.satellites.isValid()) {
-    display.printf("%d", satCount);
+    display.printf("S:%d", satCount);
   } else {
     display.print("--");
   }
@@ -1099,14 +1129,14 @@ void drawCompass() {
   }
 
   // Draw degree heading (left side, size 1)
-  display.setTextSize(1);
-  if (validCourse) {
-    char degStr[5];
-    snprintf(degStr, sizeof(degStr), "%03d", courseDegrees);
-    display.setCursor(SCREEN_WIDTH - 48, 0);  // Position before compass direction
-    display.print(degStr);
-    display.print((char)247);  // Degree symbol
-  }
+  //display.setTextSize(1);
+  //if (validCourse) {
+  //  char degStr[5];
+  //  snprintf(degStr, sizeof(degStr), "%03d", courseDegrees);
+  //  display.setCursor(SCREEN_WIDTH - 48, 0);  // Position before compass direction
+  //  display.print(degStr);
+  //  display.print((char)247);  // Degree symbol
+  //}
 
   // Draw compass direction on top right (size 2, right-aligned with 2px margin)
   display.setTextSize(2);
@@ -1143,8 +1173,8 @@ void drawSpeed() {
     double mph = gps.speed.mph();
     double kph = gps.speed.kmph();
 
-    char speedStr[20];
-    snprintf(speedStr, sizeof(speedStr), "%.0fM %.0fK", mph, kph);
+    char speedStr[24];
+    snprintf(speedStr, sizeof(speedStr), "%.0fMPH %.0fKPH", mph, kph);
 
     int textWidth = strlen(speedStr) * 6;  // 6px per char in size 1
     display.setCursor(SCREEN_WIDTH - textWidth - 2, SCREEN_HEIGHT - 8);  // 2px right margin
@@ -1187,4 +1217,31 @@ void drawBatteryIndicator() {
   display.setTextSize(1);
   display.setCursor(battX + battWidth + tipWidth + 2, battY);
   display.printf("%d", batteryPercent);
+}
+
+void drawWiFiLogo(int x, int y) {
+  // Animated WiFi icon - signal arcs radiating upward
+  // wifiAnimationState: 0 = dot only, 1 = 1 ring, 2 = 2 rings, 3 = 3 rings
+  int cx = x + 16;  // Center x
+  int cy = y + 26;  // Bottom point (where dot is)
+
+  // Always draw center dot
+  display.fillCircle(cx, cy, 3, SSD1306_WHITE);
+
+  // Draw rings based on animation state
+  int ringRadii[] = {8, 15, 22};  // Radii for the 3 rings
+
+  for (int ring = 0; ring < wifiAnimationState && ring < 3; ring++) {
+    int r = ringRadii[ring];
+    // Draw arc from -50 to +50 degrees
+    for (int angle = -55; angle <= 55; angle += 2) {
+      float rad = angle * 3.14159 / 180.0;
+      int px = cx + (int)(r * sin(rad));
+      int py = cy - (int)(r * cos(rad));
+      display.drawPixel(px, py, SSD1306_WHITE);
+      // Make arcs thicker (draw adjacent pixels)
+      display.drawPixel(px, py - 1, SSD1306_WHITE);
+      display.drawPixel(px + 1, py, SSD1306_WHITE);
+    }
+  }
 }
