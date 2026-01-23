@@ -1,6 +1,6 @@
 /*
- * SignalScout - WiFi and Bluetooth Scanner for ESP32-C5
- * Scans 2.4GHz and 5GHz WiFi networks and Bluetooth devices
+ * SignalScout - WiFi, Bluetooth, and Zigbee Scanner for ESP32-C5
+ * Scans 2.4GHz and 5GHz WiFi networks, Bluetooth LE devices, and Zigbee networks
  * Logs all activity to SD card over SPI with GPS timestamps and location
  * Displays status on SSD1309 OLED display
  *
@@ -8,6 +8,12 @@
  * SD Card: Connected via SPI
  * GPS: NEO-6M connected via UART (TX/RX)
  * OLED: SSD1309 128x64 connected via SPI
+ * RGB LED: WS2812B on GPIO27 for status indication
+ * Battery: 3.7V LiPo with voltage divider on GPIO6
+ *
+ * Zigbee Note: Requires Arduino IDE settings:
+ *   Tools -> Zigbee Mode -> Zigbee ED (End Device) [recommended for scanning]
+ *   Tools -> Partition Scheme -> Zigbee with spiffs (size appropriate for your flash)
  */
 
 #include <WiFi.h>
@@ -23,6 +29,8 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <ESP32Time.h>
+#include <Adafruit_NeoPixel.h>
+#include <Zigbee.h>
 #include <stdarg.h>
 
 // SD Card SPI Pins (adjust these based on your wiring)
@@ -45,12 +53,37 @@
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 
+// RGB LED (WS2812B) Pin
+#define LED_PIN      27      // WS2812B data pin
+#define LED_COUNT    1       // Number of LEDs
+
+// Battery ADC Pin
+#define BATTERY_PIN  6       // ADC pin for battery voltage
+#define BATTERY_SAMPLES 10   // Number of ADC samples to average
+
+// Battery voltage thresholds (3.7V LiPo)
+// Assumes voltage divider: 100k/100k (divides by 2)
+// Full charge: 4.2V -> 2.1V at ADC
+// Empty: 3.0V -> 1.5V at ADC
+#define BATTERY_FULL_VOLTAGE 4.2
+#define BATTERY_EMPTY_VOLTAGE 3.0
+#define VOLTAGE_DIVIDER_RATIO 3.3  // Adjust based on your voltage divider
+
 // Scan settings
-#define SCAN_INTERVAL 10000  // WiFi and BLE scan every 10 seconds
+#define SCAN_INTERVAL 10000  // WiFi, BLE, and Zigbee scan every 10 seconds
 #define BLE_SCAN_TIME 5      // BLE scan duration in seconds
+#define ZIGBEE_SCAN_DURATION 5  // Zigbee scan duration (1-14, higher = longer)
+
+// Zigbee settings
+// Note: Requires Arduino IDE settings:
+//   Tools -> Zigbee Mode -> Zigbee ED (End Device) [recommended for scanning]
+//   Tools -> Partition Scheme -> Zigbee 4MB with spiffs (or appropriate for your flash size)
+// ED (End Device) mode is recommended for passive scanning - lower power consumption
+// ZCZR (Coordinator/Router) mode can also scan but uses more power
+#define ENABLE_ZIGBEE_SCAN true  // Enable/disable Zigbee scanning
 
 // Output enable/disable flags
-#define ENABLE_CONSOLE_OUTPUT false   // Enable/disable serial console output
+#define ENABLE_CONSOLE_OUTPUT true   // Enable/disable serial console output
 #define ENABLE_DISPLAY_OUTPUT true   // Enable/disable OLED display output
 #define ENABLE_LOG_OUTPUT true       // Enable/disable SD card logging
 
@@ -62,12 +95,18 @@ unsigned long lastDisplayUpdate = 0;
 // Device tracking
 #include <map>
 #include <string>
-std::map<std::string, bool> seenWiFiDevices;  // Track unique WiFi devices by BSSID
-std::map<std::string, bool> seenBLEDevices;   // Track unique BLE devices by address
+std::map<std::string, bool> seenWiFiDevices;    // Track unique WiFi devices by BSSID
+std::map<std::string, bool> seenBLEDevices;     // Track unique BLE devices by address
+std::map<std::string, bool> seenZigbeeNetworks; // Track unique Zigbee networks by Extended PAN ID
 int uniqueWiFiCount = 0;
 int uniqueBLECount = 0;
-int lastWiFiScanCount = 0;  // Devices found in last scan
-int lastBLEScanCount = 0;   // Devices found in last scan
+int uniqueZigbeeCount = 0;
+int lastWiFiScanCount = 0;    // Devices found in last scan
+int lastBLEScanCount = 0;     // Devices found in last scan
+int lastZigbeeScanCount = 0;  // Networks found in last scan
+
+// Zigbee initialization flag
+bool zigbeeInitialized = false;
 
 // GPS variables
 TinyGPSPlus gps;
@@ -83,6 +122,14 @@ String logFileName;
 
 // OLED Display
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, OLED_MOSI, OLED_CLK, OLED_DC, OLED_RESET, OLED_CS);
+
+// RGB LED
+Adafruit_NeoPixel statusLED(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
+
+// Battery monitoring
+int batteryPercent = 0;
+unsigned long lastBatteryRead = 0;
+#define BATTERY_READ_INTERVAL 5000  // Read battery every 5 seconds
 
 BLEScan* pBLEScan;
 
@@ -119,6 +166,58 @@ void consolePrintf(const char* format, ...) {
   }
 }
 
+// LED color helper functions
+void setLEDColor(uint8_t r, uint8_t g, uint8_t b) {
+  statusLED.setPixelColor(0, statusLED.Color(r, g, b));
+  statusLED.show();
+}
+
+void setLEDOff() {
+  statusLED.setPixelColor(0, 0);
+  statusLED.show();
+}
+
+// LED status indicators
+void ledInitializing() {
+  setLEDColor(255, 0, 0);  // Red: Initializing
+}
+
+void ledWaitingGPS() {
+  setLEDColor(255, 165, 0);  // Orange: Waiting for GPS
+}
+
+void ledReady() {
+  setLEDColor(0, 255, 0);  // Green: Setup complete, ready
+}
+
+// Read battery voltage and calculate percentage
+int readBatteryPercent() {
+  // Take multiple samples for stability
+  long total = 0;
+  for (int i = 0; i < BATTERY_SAMPLES; i++) {
+    total += analogRead(BATTERY_PIN);
+    delay(2);
+  }
+  int avgReading = total / BATTERY_SAMPLES;
+
+  // Convert ADC reading to voltage
+  // ESP32 ADC: 12-bit (0-4095), reference 3.3V
+  float adcVoltage = (avgReading / 4095.0) * 3.3;
+
+  // Calculate actual battery voltage (accounting for voltage divider)
+  float batteryVoltage = adcVoltage * VOLTAGE_DIVIDER_RATIO;
+
+  // Calculate percentage
+  int percent = (int)(((batteryVoltage - BATTERY_EMPTY_VOLTAGE) /
+                       (BATTERY_FULL_VOLTAGE - BATTERY_EMPTY_VOLTAGE)) * 100);
+
+  // Clamp to 0-100
+  if (percent < 0) percent = 0;
+  if (percent > 100) percent = 100;
+
+  return percent;
+}
+
 // Generate log filename with timestamp
 void generateLogFileName() {
   // Check if RTC has a valid time (year > 2020 indicates valid time)
@@ -143,9 +242,20 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
 
+  // Initialize status LED first
+  statusLED.begin();
+  statusLED.setBrightness(200);  // Set brightness (0-255)
+  ledInitializing();  // Red: Starting initialization
+
   consolePrintln("\n\n=== BOOT START ===");
   consolePrintln("SignalScout - WiFi & Bluetooth Scanner with GPS");
   consolePrintln("================================================");
+
+  // Initialize battery ADC
+  analogReadResolution(12);  // 12-bit resolution
+  analogSetAttenuation(ADC_11db);  // Full range 0-3.3V
+  batteryPercent = readBatteryPercent();
+  consolePrintf("Battery level: %d%%\n", batteryPercent);
 
   // Check RTC time on boot
   consolePrintln("Checking RTC time...");
@@ -153,8 +263,8 @@ void setup() {
     consolePrintf("RTC time found: %04d-%02d-%02d %02d:%02d:%02d\n",
                   rtc.getYear(), rtc.getMonth() + 1, rtc.getDay(),
                   rtc.getHour(true), rtc.getMinute(), rtc.getSecond());
-    // RTC has valid time, we can use it immediately
-    gpsTimeValid = true;  // Allow logging with RTC time until GPS syncs
+    // RTC has valid time, we can use it immediately for logging
+    // but we still wait for GPS fix before starting scans
   } else {
     consolePrintln("No valid RTC time stored");
   }
@@ -181,8 +291,7 @@ void setup() {
   // Initialize GPS
   consolePrintln("Initializing GPS...");
   gpsSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX, GPS_TX);
-  consolePrintln("GPS initialized. Waiting for GPS fix...");
-  if (ENABLE_DISPLAY_OUTPUT) updateDisplay("Waiting for GPS");
+  consolePrintln("GPS initialized.");
 
   // Initialize SD card
   consolePrintln("Initializing SD card...");
@@ -193,9 +302,6 @@ void setup() {
       consolePrintln("Check SD card and wiring. Continuing without SD logging...");
     } else {
       consolePrintln("SD Card initialized successfully");
-      // Generate unique filename based on RTC or boot time
-      generateLogFileName();
-      logToFile("System started - SignalScout initialized");
     }
   } else {
     consolePrintln("SD logging disabled in config");
@@ -221,8 +327,103 @@ void setup() {
   pBLEScan->setWindow(99);
   consolePrintln("BLE initialized");
 
+  // Initialize Zigbee (IEEE 802.15.4)
+  // Note: Requires Arduino IDE settings:
+  //   Tools -> Zigbee Mode -> Zigbee ED (End Device)
+  //   Tools -> Partition Scheme -> Zigbee with appropriate size
+  if (ENABLE_ZIGBEE_SCAN) {
+    consolePrintln("Initializing Zigbee (IEEE 802.15.4)...");
+    // Start Zigbee stack in scanning mode (no endpoints needed for scanning)
+    // Using ZIGBEE_END_DEVICE role for passive scanning with lower power
+    if (Zigbee.begin(ZIGBEE_END_DEVICE, false)) {  // false = don't auto-start commissioning
+      zigbeeInitialized = true;
+      consolePrintln("Zigbee initialized (ED mode for passive scanning)");
+    } else {
+      consolePrintln("WARNING: Zigbee initialization failed!");
+      consolePrintln("Check Arduino IDE settings: Zigbee Mode and Partition Scheme");
+    }
+  } else {
+    consolePrintln("Zigbee scanning disabled in config");
+  }
+
+  // Wait for GPS signal before starting scans
+  ledWaitingGPS();  // Orange: Waiting for GPS
+  consolePrintln("\nWaiting for GPS signal...");
+  if (ENABLE_DISPLAY_OUTPUT) updateDisplay("Waiting for GPS");
+
+  unsigned long gpsWaitStart = millis();
+  unsigned long lastGPSStatusUpdate = 0;
+  int dotCount = 0;
+
+  while (!gps.location.isValid() || !gps.time.isValid()) {
+    // Read GPS data
+    while (gpsSerial.available() > 0) {
+      gps.encode(gpsSerial.read());
+    }
+
+    // Update display and console periodically
+    if (millis() - lastGPSStatusUpdate > 1000) {
+      lastGPSStatusUpdate = millis();
+      dotCount = (dotCount + 1) % 4;
+
+      // Build status string with dots
+      String dots = "";
+      for (int i = 0; i < dotCount; i++) dots += ".";
+
+      int sats = gps.satellites.isValid() ? gps.satellites.value() : 0;
+      consolePrintf("Waiting for GPS fix%s (Satellites: %d)\n", dots.c_str(), sats);
+
+      if (ENABLE_DISPLAY_OUTPUT) {
+        display.clearDisplay();
+        display.setTextSize(1);
+        display.setCursor(0, 0);
+        display.println("Waiting for GPS");
+        display.setCursor(0, 16);
+        display.printf("Satellites: %d", sats);
+        display.setCursor(0, 32);
+        unsigned long elapsed = (millis() - gpsWaitStart) / 1000;
+        display.printf("Elapsed: %lus", elapsed);
+
+        // Show battery during GPS wait
+        display.setCursor(0, 48);
+        display.printf("Battery: %d%%", readBatteryPercent());
+
+        display.display();
+      }
+    }
+
+    delay(100);
+  }
+
+  // GPS signal acquired!
+  gpsTimeValid = true;
+  consolePrintln("\nGPS signal acquired!");
+  displayGPSInfo();
+
+  // Sync RTC from GPS
+  rtc.setTime(gps.time.second(), gps.time.minute(), gps.time.hour(),
+              gps.date.day(), gps.date.month(), gps.date.year());
+  rtcSyncedFromGPS = true;
+  consolePrintln("RTC synced from GPS time!");
+
+  // Generate log filename now that we have valid time
+  if (ENABLE_LOG_OUTPUT) {
+    generateLogFileName();
+    logToFile("System started - SignalScout initialized");
+    logToFile("GPS signal acquired");
+  }
+
+  // Setup complete
+  ledReady();  // Green: Ready
   consolePrintln("\nInitialization complete. Starting scans...\n");
-  if (ENABLE_LOG_OUTPUT) logToFile("Initialization complete");
+  if (ENABLE_LOG_OUTPUT) logToFile("Initialization complete - entering main loop");
+
+  // Brief pause to show green LED
+  delay(1000);
+
+  // Turn off LED to conserve battery
+  setLEDOff();
+  consolePrintln("Status LED turned off to conserve battery");
 }
 
 void loop() {
@@ -232,38 +433,23 @@ void loop() {
     gps.encode(c);
   }
 
-  // Check if we have a valid GPS time fix and sync RTC
+  // Periodically update RTC from GPS (every ~60 seconds) to keep it accurate
   if (gps.time.isValid() && gps.date.isValid()) {
-    // Sync RTC from GPS if not already synced this session
-    if (!rtcSyncedFromGPS) {
-      // Set RTC time from GPS
+    static unsigned long lastRTCSync = 0;
+    if (millis() - lastRTCSync > 60000) {
       rtc.setTime(gps.time.second(), gps.time.minute(), gps.time.hour(),
                   gps.date.day(), gps.date.month(), gps.date.year());
-      rtcSyncedFromGPS = true;
-      consolePrintln("RTC synced from GPS time!");
-      consolePrintf("RTC set to: %04d-%02d-%02d %02d:%02d:%02d\n",
-                    rtc.getYear(), rtc.getMonth() + 1, rtc.getDay(),
-                    rtc.getHour(true), rtc.getMinute(), rtc.getSecond());
-
-      // If this is first GPS lock (not using stored RTC), announce it
-      if (!gpsTimeValid) {
-        gpsTimeValid = true;
-        consolePrintln("GPS time lock acquired!");
-        if (ENABLE_LOG_OUTPUT) logToFile("GPS time lock acquired");
-        displayGPSInfo();
-      }
-    } else {
-      // Periodically update RTC from GPS (every ~60 seconds) to keep it accurate
-      static unsigned long lastRTCSync = 0;
-      if (millis() - lastRTCSync > 60000) {
-        rtc.setTime(gps.time.second(), gps.time.minute(), gps.time.hour(),
-                    gps.date.day(), gps.date.month(), gps.date.year());
-        lastRTCSync = millis();
-      }
+      lastRTCSync = millis();
     }
   }
 
   unsigned long currentTime = millis();
+
+  // Update battery reading periodically
+  if (currentTime - lastBatteryRead >= BATTERY_READ_INTERVAL) {
+    batteryPercent = readBatteryPercent();
+    lastBatteryRead = currentTime;
+  }
 
   // Update display
   if (ENABLE_DISPLAY_OUTPUT && currentTime - lastDisplayUpdate >= DISPLAY_UPDATE_INTERVAL) {
@@ -271,11 +457,14 @@ void loop() {
     lastDisplayUpdate = currentTime;
   }
 
-  // Perform WiFi and BLE scans together
+  // Perform WiFi, BLE, and Zigbee scans together
   if (currentTime - lastScan >= SCAN_INTERVAL) {
     consolePrintf("\n[%lu] Starting scan cycle...\n", millis());
     scanWiFi();
     scanBluetooth();
+    if (ENABLE_ZIGBEE_SCAN && zigbeeInitialized) {
+      scanZigbee();
+    }
     lastScan = currentTime;
     consolePrintf("[%lu] Scan cycle complete\n", millis());
   }
@@ -483,6 +672,119 @@ void scanBluetooth() {
   consolePrintln("--- Bluetooth Scan Complete ---\n");
 }
 
+void scanZigbee() {
+  consolePrintln("\n--- Zigbee Scan Starting (IEEE 802.15.4) ---");
+
+  // Start network scan on all Zigbee channels (11-26)
+  Zigbee.scanNetworks();
+
+  // Wait for scan to complete
+  int16_t scanStatus;
+  unsigned long scanStart = millis();
+  unsigned long timeout = 30000;  // 30 second timeout
+
+  do {
+    scanStatus = Zigbee.scanComplete();
+    delay(100);
+
+    // Check for timeout
+    if (millis() - scanStart > timeout) {
+      consolePrintln("Zigbee scan timeout");
+      lastZigbeeScanCount = 0;
+      return;
+    }
+  } while (scanStatus == ZB_SCAN_RUNNING);
+
+  // Check scan result
+  if (scanStatus == ZB_SCAN_FAILED) {
+    consolePrintln("Zigbee scan failed");
+    lastZigbeeScanCount = 0;
+    return;
+  }
+
+  int networkCount = scanStatus;
+  lastZigbeeScanCount = networkCount;
+
+  consolePrintf("Zigbee networks found: %d\n", networkCount);
+
+  if (networkCount == 0) {
+    consolePrintln("No Zigbee networks found");
+    return;
+  }
+
+  // Get pointer to scan results array
+  zigbee_scan_result_t* scanResults = Zigbee.getScanResult();
+  if (scanResults == NULL) {
+    consolePrintln("Failed to get scan results");
+    return;
+  }
+
+  // Process each network found
+  for (int i = 0; i < networkCount; i++) {
+    // Access result at index i
+    zigbee_scan_result_t* network = &scanResults[i];
+
+    // Format Extended PAN ID (8 bytes, reversed order)
+    char extPanIdStr[24];
+    snprintf(extPanIdStr, sizeof(extPanIdStr), "%02X:%02X:%02X:%02X:%02X:%02X:%02X:%02X",
+             network->extended_pan_id[7], network->extended_pan_id[6],
+             network->extended_pan_id[5], network->extended_pan_id[4],
+             network->extended_pan_id[3], network->extended_pan_id[2],
+             network->extended_pan_id[1], network->extended_pan_id[0]);
+
+    // Format PAN ID (2 bytes) - use short_pan_id field
+    char panIdStr[8];
+    snprintf(panIdStr, sizeof(panIdStr), "0x%04X", network->short_pan_id);
+
+    // Track unique networks by Extended PAN ID
+    std::string extPanIdKey(extPanIdStr);
+    if (seenZigbeeNetworks.find(extPanIdKey) == seenZigbeeNetworks.end()) {
+      seenZigbeeNetworks[extPanIdKey] = true;
+      uniqueZigbeeCount++;
+    }
+
+    // Get channel number
+    uint8_t channel = network->logic_channel;
+
+    // Get network characteristics
+    bool permitJoining = network->permit_joining;
+    bool routerCapacity = network->router_capacity;
+    bool endDeviceCapacity = network->end_device_capacity;
+
+    // Generate fingerprint from Extended PAN ID and PAN ID
+    String fingerprintData = String(extPanIdStr) + String(panIdStr);
+    uint32_t fingerprint = 0;
+    for (unsigned int j = 0; j < fingerprintData.length(); j++) {
+      fingerprint = fingerprint * 31 + fingerprintData.charAt(j);
+    }
+    char fingerprintStr[9];
+    snprintf(fingerprintStr, sizeof(fingerprintStr), "%08X", fingerprint);
+
+    // Print to Serial
+    consolePrintf("%d: PAN: %s | ExtPAN: %s | Ch: %d | Join: %s | FP: %s\n",
+                  i + 1, panIdStr, extPanIdStr, channel,
+                  permitJoining ? "Yes" : "No", fingerprintStr);
+    consolePrintf("   Router Cap: %s | End Device Cap: %s\n",
+                  routerCapacity ? "Yes" : "No",
+                  endDeviceCapacity ? "Yes" : "No");
+
+    // Log to SD card
+    // Format: ZIGBEE,FP,Time,Lat,Lon,Alt,Sats,HDOP,PAN_ID,Ext_PAN_ID,Channel,PermitJoin,RouterCap,EDCap
+    if (ENABLE_LOG_OUTPUT) {
+      String joinStr = permitJoining ? "Yes" : "No";
+      String routerStr = routerCapacity ? "Yes" : "No";
+      String edStr = endDeviceCapacity ? "Yes" : "No";
+      logDeviceToFile("ZIGBEE", String(panIdStr), String(extPanIdStr), String(channel),
+                      joinStr, routerStr, edStr, fingerprintStr);
+    }
+  }
+
+  // Clear scan results to free memory
+  Zigbee.scanDelete();
+
+  consolePrintln("--- Zigbee Scan Complete ---\n");
+}
+
 void logDeviceToFile(String deviceType, String param1, String param2, String param3,
                      String param4, String param5, String param6, String fingerprint) {
   if (!ENABLE_LOG_OUTPUT) return;
@@ -543,6 +845,9 @@ void logDeviceToFile(String deviceType, String param1, String param2, String par
   } else if (deviceType == "BLE") {
     // BLE: Name, Address, RSSI, ManufData, ServiceUUID
     logEntry += param1 + "," + param2 + "," + param3 + "," + param4 + "," + param5;
+  } else if (deviceType == "ZIGBEE") {
+    // ZIGBEE: PAN_ID, Ext_PAN_ID, Channel, PermitJoin, RouterCap, EDCap
+    logEntry += param1 + "," + param2 + "," + param3 + "," + param4 + "," + param5 + "," + param6;
   }
 
   logFile.println(logEntry);
@@ -670,6 +975,9 @@ void updateDisplay(String statusMessage) {
   // Top Left: Satellite Signal Strength Indicator
   drawSatelliteIndicator();
 
+  // Top Center: Battery Indicator
+  drawBatteryIndicator();
+
   // Top Right: Compass Direction
   drawCompass();
 
@@ -679,20 +987,22 @@ void updateDisplay(String statusMessage) {
     display.setCursor(0, 24);
     if (statusMessage.length() > 0) {
       display.println(statusMessage);
-    } else if (!gpsTimeValid) {
-      display.println("Waiting GPS");
-    }
+    } 
   } else {
     // Show device statistics and countdown
     display.setTextSize(1);
 
     // WiFi count: Last scan (Total)
-    display.setCursor(2, 22);
+    display.setCursor(2, 18);
     display.printf("W:%d(%d)", lastWiFiScanCount, uniqueWiFiCount);
 
     // BLE count: Last scan (Total)
-    display.setCursor(2, 38);
+    display.setCursor(2, 28);
     display.printf("B:%d(%d)", lastBLEScanCount, uniqueBLECount);
+
+    // Zigbee count: Last scan (Total)
+    display.setCursor(2, 38);
+    display.printf("Z:%d(%d)", lastZigbeeScanCount, uniqueZigbeeCount);
 
     // Countdown timer on right side (right-aligned with margin)
     unsigned long currentTime = millis();
@@ -702,7 +1012,7 @@ void updateDisplay(String statusMessage) {
 
     display.setTextSize(1);
     // Right align "Scan in:" - 8 chars * 6px = 48px from right edge (128-48-2=78)
-    display.setCursor(70, 22);
+    display.setCursor(70, 18);
     display.print("Scan in:");
 
     display.setTextSize(2);
@@ -710,7 +1020,7 @@ void updateDisplay(String statusMessage) {
     char secStr[4];
     snprintf(secStr, sizeof(secStr), "%ds", secondsLeft);
     int secWidth = strlen(secStr) * 12;  // 12px per char in size 2
-    display.setCursor(SCREEN_WIDTH - secWidth - 2, 34);
+    display.setCursor(SCREEN_WIDTH - secWidth - 2, 30);
     display.print(secStr);
   }
 
@@ -844,4 +1154,37 @@ void drawSpeed() {
     display.setCursor(SCREEN_WIDTH - textWidth - 2, SCREEN_HEIGHT - 8);  // 2px right margin
     display.print("0M 0K");
   }
+}
+
+void drawBatteryIndicator() {
+  // Battery icon dimensions
+  int battX = 50;  // X position (between satellite and compass)
+  int battY = 2;   // Y position
+  int battWidth = 16;
+  int battHeight = 8;
+  int tipWidth = 2;
+  int tipHeight = 4;
+
+  // Draw battery outline
+  display.drawRect(battX, battY, battWidth, battHeight, SSD1306_WHITE);
+
+  // Draw battery tip (positive terminal)
+  display.fillRect(battX + battWidth, battY + (battHeight - tipHeight) / 2,
+                   tipWidth, tipHeight, SSD1306_WHITE);
+
+  // Calculate fill width based on percentage
+  int fillWidth = ((battWidth - 2) * batteryPercent) / 100;
+  if (fillWidth < 0) fillWidth = 0;
+  if (fillWidth > battWidth - 2) fillWidth = battWidth - 2;
+
+  // Fill battery based on charge level
+  if (fillWidth > 0) {
+    display.fillRect(battX + 1, battY + 1, fillWidth, battHeight - 2, SSD1306_WHITE);
+  }
+
+  // Draw percentage text below battery if space allows, or to the side
+  // Using small font next to battery
+  display.setTextSize(1);
+  display.setCursor(battX + battWidth + tipWidth + 2, battY);
+  display.printf("%d", batteryPercent);
 }

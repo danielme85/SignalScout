@@ -2,40 +2,56 @@
 
 # SignalScout 📡
 
-**A portable WiFi and Bluetooth scanner with GPS tracking for ESP32-C5**
+**A portable WiFi, Bluetooth, and Zigbee scanner with GPS tracking for ESP32-C5**
 
-SignalScout is a wardriving and wireless reconnaissance tool that scans both 2.4GHz and 5GHz WiFi networks plus Bluetooth Low Energy (BLE) devices, logging everything to an SD card with precise GPS coordinates and timestamps.
+SignalScout is a wardriving and wireless reconnaissance tool that scans 2.4GHz and 5GHz WiFi networks, Bluetooth Low Energy (BLE) devices, and Zigbee networks (IEEE 802.15.4), logging everything to an SD card with precise GPS coordinates and timestamps.
 
 ## Features
 
 - 📶 Dual-band WiFi scanning (2.4GHz & 5GHz)
 - 🔵 Bluetooth Low Energy (BLE) device discovery
+- 🟢 Zigbee network scanning (IEEE 802.15.4, channels 11-26)
 - 📍 GPS-tagged logging with location, altitude, and satellite data
 - 📊 Real-time OLED display with stats and countdown
 - 💾 CSV logging to SD card for mapping and analysis
 - 🧭 Built-in compass and speed display
 - 🔒 Encryption type detection
+- 🔋 Battery level monitoring with on-screen indicator
+- 💡 RGB LED status indicator during boot sequence
 
 ## Hardware Required
 
 | Component | Example Model | Connection |
 |-----------|--------------|------------|
 | **Microcontroller** | ESP32-C5 Dev Board (16MB Flash, 8MB PSRAM) | - |
-| **GPS Module** | NEO-6M or NEO-7M | UART (RX:16, TX:17) |
-| **OLED Display** | SSD1309 128x64 (or SSD1306) | SPI (MOSI:23, CLK:18, DC:4, CS:15, RST:2) |
-| **SD Card Module** | Micro SD SPI adapter | SPI (MOSI:23, MISO:19, CLK:18, CS:5) |
-| **Power** | 18650 battery + holder, USB power bank | 5V input |
+| **GPS Module** | NEO-6M or NEO-7M | UART (RX:14, TX:13) |
+| **OLED Display** | SSD1309 128x64 (or SSD1306) | SPI (MOSI:26, CLK:25, DC:9, CS:8, RST:10) |
+| **SD Card Module** | Micro SD SPI adapter | SPI (MOSI:3, MISO:1, CLK:0, CS:2) |
+| **RGB LED** | WS2812B | Data: GPIO27 |
+| **Battery** | 3.7V LiPo 3000mAh | Via charging port + voltage divider to GPIO6 |
 
 > **Note:** MOSI and CLK pins can be shared between SD card and OLED display since both use SPI, but each needs a unique CS (Chip Select) pin.
+
+### Battery Voltage Divider
+
+To monitor battery voltage, connect a voltage divider between the battery and GPIO6:
+```
+Battery (+) ──┬── 100kΩ ──┬── 100kΩ ──┬── GND
+              │           │           │
+              │         GPIO6         │
+              │        (ADC)          │
+```
+This divides the voltage by 2, allowing the 3.3V ADC to safely read up to 6.6V.
 
 ## Display Layout
 
 ```
 ┌──────────────────────────────────────────────┐
-│ 📡5 ▂▄▆█  065° NE                           │  ← Satellite count + signal bars + compass
+│ 📡5 ▂▄▆█  [██░]85  065° NE                  │  ← Satellites + battery + compass
 ├──────────────────────────────────────────────┤
 │ W:12(47)                    Scan in:         │  ← WiFi devices (last scan/total)
 │ B:8(23)                           5s         │  ← BLE devices + countdown timer
+│ Z:2(5)                                       │  ← Zigbee networks (last scan/total)
 ├──────────────────────────────────────────────┤
 │ 14:23:57                       45M 72K       │  ← GPS time (UTC) + speed (MPH/KPH)
 └──────────────────────────────────────────────┘
@@ -44,8 +60,9 @@ SignalScout is a wardriving and wireless reconnaissance tool that scans both 2.4
 ### Display Elements
 
 - **Top Left:** Satellite icon with signal strength bars (0-5 bars based on satellite count)
+- **Top Center:** Battery indicator with icon and percentage
 - **Top Right:** Heading in degrees and compass direction (N, NE, E, SE, S, SW, W, NW)
-- **Center Left:** Device counters showing last scan count with total unique devices in parentheses
+- **Center Left:** Device counters - W (WiFi), B (BLE), Z (Zigbee) with last scan/total counts
 - **Center Right:** Countdown timer showing seconds until next scan
 - **Bottom Left:** Current UTC time from GPS
 - **Bottom Right:** Current speed in both MPH and KPH
@@ -70,53 +87,72 @@ Go to Tools → Manage Libraries and install:
 - `TinyGPSPlus` by Mikal Hart
 - `Adafruit GFX Library`
 - `Adafruit SSD1306`
+- `Adafruit NeoPixel`
+- `ESP32Time`
 
 ### 2. Hardware Assembly
 
 1. **Connect GPS Module to ESP32:**
-   - GPS TX → ESP32 RX (Pin 16)
-   - GPS RX → ESP32 TX (Pin 17)
+   - GPS TX → ESP32 RX (GPIO14)
+   - GPS RX → ESP32 TX (GPIO13)
    - GPS VCC → 3.3V or 5V
    - GPS GND → GND
 
 2. **Connect OLED Display (SPI):**
-   - MOSI → Pin 23
-   - CLK/SCK → Pin 18
-   - DC → Pin 4
-   - CS → Pin 15
-   - RESET → Pin 2
+   - MOSI → GPIO26
+   - CLK/SCK → GPIO25
+   - DC → GPIO9
+   - CS → GPIO8
+   - RESET → GPIO10
    - VCC → 3.3V
    - GND → GND
 
 3. **Connect SD Card Module (SPI):**
-   - MOSI → Pin 23 (shared with OLED)
-   - MISO → Pin 19
-   - CLK/SCK → Pin 18 (shared with OLED)
-   - CS → Pin 5
+   - MOSI → GPIO3
+   - MISO → GPIO1
+   - CLK/SCK → GPIO0
+   - CS → GPIO2
    - VCC → 5V (or 3.3V depending on module)
    - GND → GND
 
-4. **Insert a formatted SD card** (FAT32 recommended)
+4. **Connect RGB LED (WS2812B):**
+   - Data → GPIO27
+   - VCC → 5V
+   - GND → GND
+
+5. **Connect Battery Monitor (voltage divider):**
+   - Battery (+) → 100kΩ resistor → GPIO6 → 100kΩ resistor → GND
+   - See voltage divider diagram above
+
+6. **Insert a formatted SD card** (FAT32 recommended)
 
 ### 3. Upload Code
 
-1. Open `WifiScanner.ino` in Arduino IDE
+1. Open `SignalScout.ino` in Arduino IDE
 2. Select board: Tools → Board → ESP32 → ESP32-C5
 3. Select the correct COM port: Tools → Port
-4. Click Upload ⬆️
-5. Open Serial Monitor (115200 baud) to see scan output
+4. **Configure Zigbee settings:**
+   - Tools → Zigbee Mode → **Zigbee ED (End Device)** (recommended for scanning)
+   - Tools → Partition Scheme → **Zigbee 4MB with spiffs** (or appropriate for your flash size)
+5. Click Upload
+6. Open Serial Monitor (115200 baud) to see scan output
 
 ### 4. Field Operation
 
 1. **Power on the device** outdoors for GPS signal
-2. **Wait for GPS lock** - display shows "Waiting GPS" until satellites are acquired (30-60 seconds)
-3. **Start moving** to see compass direction and speed (requires >1 km/h movement)
-4. **Scans run automatically** every 10 seconds
-5. **Data is logged** to `/scanner_log.txt` on the SD card
+2. **Watch LED indicators:**
+   - 🔴 **Red** = System initializing
+   - 🟠 **Orange** = Waiting for GPS signal
+   - 🟢 **Green** = Ready, about to start scanning
+   - ⚫ **Off** = Scanning active (LED off to save battery)
+3. **Wait for GPS lock** - display shows "Waiting GPS" with satellite count and elapsed time (30-60 seconds)
+4. **Scans run automatically** after GPS lock, every 10 seconds
+5. **Start moving** to see compass direction and speed (requires >1 km/h movement)
+6. **Data is logged** to `/scan_YYYYMMDD_HHMMSS.txt` on the SD card
 
 ## Log File Format
 
-Each device is logged on one line with complete GPS data:
+Each device/network is logged on one line with complete GPS data:
 
 **WiFi Entry:**
 ```
@@ -128,22 +164,37 @@ WIFI,A3F2C891,2026-01-21 15:30:45,37.774929,-122.419418,15.50,8,1.20,MyNetwork,A
 BLE,B7E4D123,2026-01-21 15:30:46,37.774930,-122.419420,15.52,8,1.20,MyDevice,12:34:56:78:9A:BC,-72,ManufData,ServiceUUID
 ```
 
+**Zigbee Entry:**
+```
+ZIGBEE,C8D5E234,2026-01-21 15:30:47,37.774931,-122.419422,15.54,8,1.20,0x1A2B,00:11:22:33:44:55:66:77,15,Yes,Yes,Yes
+```
+
 **Format:** `TYPE,Fingerprint,Timestamp,Lat,Lon,Alt,Sats,HDOP,DeviceParams...`
+
+**Zigbee Fields:** PAN_ID, Extended_PAN_ID, Channel, PermitJoining, RouterCapacity, EndDeviceCapacity
 
 ## Configuration
 
-Key settings can be adjusted at the top of `WifiScanner.ino`:
+Key settings can be adjusted at the top of `SignalScout.ino`:
 
 ```cpp
 // Output control
 #define ENABLE_CONSOLE_OUTPUT true   // Serial console output
 #define ENABLE_DISPLAY_OUTPUT true   // OLED display
 #define ENABLE_LOG_OUTPUT true       // SD card logging
+#define ENABLE_ZIGBEE_SCAN true      // Zigbee network scanning
 
 // Timing
-#define SCAN_INTERVAL 10000  // Scan every 10 seconds
-#define BLE_SCAN_TIME 5      // BLE scan duration (seconds)
+#define SCAN_INTERVAL 10000        // Scan every 10 seconds
+#define BLE_SCAN_TIME 5            // BLE scan duration (seconds)
+#define ZIGBEE_SCAN_DURATION 5     // Zigbee scan duration (1-14)
 ```
+
+### Zigbee Mode Selection
+
+In Arduino IDE, configure Zigbee via Tools menu:
+- **Zigbee ED (End Device)**: Recommended for scanning - passive, low power
+- **Zigbee ZCZR (Coordinator/Router)**: Alternative - can also route traffic
 
 ## Troubleshooting
 
@@ -154,6 +205,12 @@ Key settings can be adjusted at the top of `WifiScanner.ino`:
 | **Display shows nothing** | Verify OLED wiring, check if SSD1309/SSD1306 is set correctly in code |
 | **No WiFi networks found** | Normal in remote areas, verify ESP32 WiFi is working |
 | **Compass shows "---"** | GPS course requires movement >1 km/h, start walking/driving |
+| **LED stays red** | Initialization stuck, check serial monitor for errors |
+| **LED stays orange** | GPS not getting signal, move to open sky area |
+| **Battery shows 0% or wrong** | Check voltage divider wiring, adjust `VOLTAGE_DIVIDER_RATIO` in code |
+| **Zigbee init failed** | Check Arduino IDE: Zigbee Mode and Partition Scheme must be configured |
+| **No Zigbee networks found** | Normal if no Zigbee/Thread devices nearby; they're less common than WiFi |
+| **Z:0(0) always** | Ensure `ENABLE_ZIGBEE_SCAN true` and correct IDE settings |
 
 ## Data Analysis
 
