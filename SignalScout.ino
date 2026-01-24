@@ -62,12 +62,12 @@
 #define BATTERY_SAMPLES 10   // Number of ADC samples to average
 
 // Battery voltage thresholds (3.7V LiPo)
-// Assumes voltage divider: 100k/100k (divides by 2)
-// Full charge: 4.2V -> 2.1V at ADC
-// Empty: 3.0V -> 1.5V at ADC
+// Voltage divider: 200k (positive side) / 100k (to ground) = divides by 3
+// Full charge: 4.2V -> 1.4V at ADC
+// Empty: 3.0V -> 1.0V at ADC
 #define BATTERY_FULL_VOLTAGE 4.2
 #define BATTERY_EMPTY_VOLTAGE 3.0
-#define VOLTAGE_DIVIDER_RATIO 3.3  // Adjust based on your voltage divider
+#define VOLTAGE_DIVIDER_RATIO 3.0  // For 200k/100k voltage divider
 
 // Scan settings
 #define SCAN_INTERVAL 1  // WiFi, BLE, and Zigbee scan every second
@@ -90,7 +90,38 @@
 // Timing variables
 unsigned long lastScan = 0;
 unsigned long lastDisplayUpdate = 0;
-#define DISPLAY_UPDATE_INTERVAL 500  // Update display every 500ms
+#define DISPLAY_UPDATE_INTERVAL 1000  // Update display every 1000ms (1 second)
+
+// FreeRTOS Task Handles
+TaskHandle_t wifiScanTaskHandle = NULL;
+TaskHandle_t bleScanTaskHandle = NULL;
+TaskHandle_t zigbeeScanTaskHandle = NULL;
+TaskHandle_t displayTaskHandle = NULL;
+TaskHandle_t sdLogTaskHandle = NULL;
+
+// FreeRTOS Semaphores and Mutexes
+SemaphoreHandle_t deviceMapMutex;
+SemaphoreHandle_t sdCardMutex;
+SemaphoreHandle_t displayMutex;
+
+// Queue for SD card logging (non-blocking)
+QueueHandle_t logQueue;
+#define LOG_QUEUE_SIZE 50
+
+// Log entry structure for queue
+struct LogEntry {
+  char type[10];
+  char fingerprint[9];
+  char param1[128];
+  char param2[64];
+  char param3[32];
+  char param4[128];
+  char param5[128];
+  char param6[32];
+};
+
+// Flag to indicate log file is ready
+bool logFileReady = false;
 
 // Device tracking
 #include <map>
@@ -222,8 +253,8 @@ int readBatteryPercent() {
   return percent;
 }
 
-// Generate log filename with timestamp
-void generateLogFileName() {
+// Generate log filename with timestamp and create/open the file
+bool generateLogFileName() {
   // Check if RTC has a valid time (year > 2020 indicates valid time)
   if (rtc.getYear() > 2020) {
     // Use RTC time for filename
@@ -240,6 +271,153 @@ void generateLogFileName() {
     logFileName = String(filename);
     consolePrintf("No RTC time available, using boot timestamp: %s\n", filename);
   }
+
+  // Create the file and write header
+  if (xSemaphoreTake(sdCardMutex, portMAX_DELAY) == pdTRUE) {
+    File logFile = SD.open(logFileName.c_str(), FILE_WRITE);
+    if (logFile) {
+      logFile.println("=== SignalScout Log File ===");
+      logFile.println("Format: TYPE,Fingerprint,Timestamp,Lat,Lon,Alt,Sats,HDOP,DeviceParams...");
+      logFile.close();
+      consolePrintf("Log file created successfully: %s\n", logFileName.c_str());
+      xSemaphoreGive(sdCardMutex);
+      return true;
+    } else {
+      consolePrintln("ERROR: Failed to create log file!");
+      xSemaphoreGive(sdCardMutex);
+      return false;
+    }
+  }
+  return false;
+}
+
+// FreeRTOS Task: WiFi Scanner
+void wifiScanTask(void* parameter) {
+  vTaskDelay(pdMS_TO_TICKS(100));  // Initial stagger delay
+  while (true) {
+    if (logFileReady) {
+      consolePrintf("\n[WiFi Task] Starting WiFi scan at %lu ms\n", millis());
+      scanWiFi();
+    }
+    vTaskDelay(pdMS_TO_TICKS(SCAN_INTERVAL * 1000));  // Convert to milliseconds
+  }
+}
+
+// FreeRTOS Task: Bluetooth Scanner
+void bleScanTask(void* parameter) {
+  vTaskDelay(pdMS_TO_TICKS(300));  // Initial stagger delay (offset from WiFi)
+  while (true) {
+    if (logFileReady) {
+      consolePrintf("\n[BLE Task] Starting BLE scan at %lu ms\n", millis());
+      scanBluetooth();
+    }
+    vTaskDelay(pdMS_TO_TICKS(SCAN_INTERVAL * 1000));  // Convert to milliseconds
+  }
+}
+
+// FreeRTOS Task: Zigbee Scanner
+void zigbeeScanTask(void* parameter) {
+  vTaskDelay(pdMS_TO_TICKS(500));  // Initial stagger delay (offset from WiFi and BLE)
+  while (true) {
+    if (logFileReady && ENABLE_ZIGBEE_SCAN && zigbeeInitialized) {
+      consolePrintf("\n[Zigbee Task] Starting Zigbee scan at %lu ms\n", millis());
+      scanZigbee();
+    }
+    vTaskDelay(pdMS_TO_TICKS(SCAN_INTERVAL * 1000));  // Convert to milliseconds
+  }
+}
+
+// FreeRTOS Task: Display Updater
+void displayTask(void* parameter) {
+  while (true) {
+    if (ENABLE_DISPLAY_OUTPUT) {
+      if (xSemaphoreTake(displayMutex, portMAX_DELAY) == pdTRUE) {
+        updateDisplay("");
+        xSemaphoreGive(displayMutex);
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(DISPLAY_UPDATE_INTERVAL));
+  }
+}
+
+// FreeRTOS Task: SD Card Logger (processes queue)
+void sdLogTask(void* parameter) {
+  LogEntry entry;
+  while (true) {
+    // Wait for log entries in the queue
+    if (xQueueReceive(logQueue, &entry, portMAX_DELAY) == pdTRUE) {
+      // Process the log entry
+      if (ENABLE_LOG_OUTPUT && sdCardMounted && logFileReady) {
+        if (xSemaphoreTake(sdCardMutex, portMAX_DELAY) == pdTRUE) {
+          File logFile = SD.open(logFileName.c_str(), FILE_APPEND);
+          if (logFile) {
+            // Get timestamp and GPS data
+            String timestamp;
+            String gpsLat = "N/A";
+            String gpsLon = "N/A";
+            String gpsAlt = "N/A";
+            String gpsSats = "N/A";
+            String gpsHdop = "N/A";
+
+            if (gps.time.isValid() && gps.date.isValid()) {
+              char dateTime[32];
+              snprintf(dateTime, sizeof(dateTime), "%04d-%02d-%02d %02d:%02d:%02d",
+                       gps.date.year(), gps.date.month(), gps.date.day(),
+                       gps.time.hour(), gps.time.minute(), gps.time.second());
+              timestamp = String(dateTime);
+
+              if (gps.location.isValid()) {
+                gpsLat = String(gps.location.lat(), 6);
+                gpsLon = String(gps.location.lng(), 6);
+              }
+              if (gps.altitude.isValid()) {
+                gpsAlt = String(gps.altitude.meters(), 2);
+              }
+              if (gps.satellites.isValid()) {
+                gpsSats = String(gps.satellites.value());
+              }
+              if (gps.hdop.isValid()) {
+                gpsHdop = String(gps.hdop.hdop(), 2);
+              }
+            } else if (rtc.getYear() > 2020) {
+              char dateTime[32];
+              snprintf(dateTime, sizeof(dateTime), "%04d-%02d-%02d %02d:%02d:%02d",
+                       rtc.getYear(), rtc.getMonth() + 1, rtc.getDay(),
+                       rtc.getHour(true), rtc.getMinute(), rtc.getSecond());
+              timestamp = String(dateTime) + " (RTC)";
+            } else {
+              timestamp = String(millis()) + "ms";
+            }
+
+            // Build log entry string
+            String logStr = String(entry.type) + "," + String(entry.fingerprint) + "," +
+                           timestamp + "," + gpsLat + "," + gpsLon + "," + gpsAlt + "," +
+                           gpsSats + "," + gpsHdop + ",";
+
+            if (String(entry.type) == "WIFI") {
+              logStr += String(entry.param1) + "," + String(entry.param2) + "," +
+                       String(entry.param3) + "," + String(entry.param4) + "," +
+                       String(entry.param5) + "," + String(entry.param6);
+            } else if (String(entry.type) == "BLE") {
+              logStr += String(entry.param1) + "," + String(entry.param2) + "," +
+                       String(entry.param3) + "," + String(entry.param4) + "," +
+                       String(entry.param5);
+            } else if (String(entry.type) == "ZIGBEE") {
+              logStr += String(entry.param1) + "," + String(entry.param2) + "," +
+                       String(entry.param3) + "," + String(entry.param4) + "," +
+                       String(entry.param5) + "," + String(entry.param6);
+            }
+
+            logFile.println(logStr);
+            logFile.close();
+          } else {
+            consolePrintln("ERROR: Failed to open log file in SD task");
+          }
+          xSemaphoreGive(sdCardMutex);
+        }
+      }
+    }
+  }
 }
 
 void setup() {
@@ -255,22 +433,44 @@ void setup() {
   consolePrintln("SignalScout - WiFi, Bluetooth & Zigbee Scanner with GPS");
   consolePrintln("=========================================================");
 
+  // Create FreeRTOS mutexes and queue
+  consolePrintln("\n[0/7] Initializing FreeRTOS resources...");
+  deviceMapMutex = xSemaphoreCreateMutex();
+  sdCardMutex = xSemaphoreCreateMutex();
+  displayMutex = xSemaphoreCreateMutex();
+  logQueue = xQueueCreate(LOG_QUEUE_SIZE, sizeof(LogEntry));
+
+  if (deviceMapMutex == NULL || sdCardMutex == NULL || displayMutex == NULL || logQueue == NULL) {
+    consolePrintln("ERROR: Failed to create FreeRTOS resources!");
+    while(1);  // Halt
+  }
+  consolePrintln("FreeRTOS mutexes and queue created successfully");
+
   // ============================================
   // CRITICAL: Initialize SD card FIRST before any radio initialization
   // The Zigbee/BLE radios can interfere with SPI if initialized first
   // ============================================
   consolePrintln("\n[1/7] Initializing SD card (SPI)...");
   if (ENABLE_LOG_OUTPUT) {
+    consolePrintf("SD Card pins: CS=%d, MOSI=%d, MISO=%d, SCK=%d\n", SD_CS, SD_MOSI, SD_MISO, SD_SCK);
+
     // Initialize SPI bus for SD card
     SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
-    delay(100);  // Allow SPI to stabilize
+    delay(250);  // Longer delay for SPI to stabilize
 
-    // Try to mount SD card with retries
-    int retries = 3;
+    // Try to mount SD card with retries at different speeds
+    int retries = 5;
+    uint32_t spiSpeeds[] = {1000000, 2000000, 4000000, 8000000};  // Try different speeds
+    int speedIndex = 0;
+
     while (retries > 0 && !sdCardMounted) {
-      if (SD.begin(SD_CS, SPI, 4000000)) {  // 4MHz SPI speed for compatibility
+      uint32_t currentSpeed = spiSpeeds[speedIndex % 4];
+      consolePrintf("Attempting SD card mount at %lu Hz (attempt %d/%d)...\n",
+                    currentSpeed, (6 - retries), 5);
+
+      if (SD.begin(SD_CS, SPI, currentSpeed, "/sd", 5, false)) {
         sdCardMounted = true;
-        consolePrintln("SD Card mounted successfully");
+        consolePrintf("SD Card mounted successfully at %lu Hz\n", currentSpeed);
 
         // Verify we can actually write to the card
         File testFile = SD.open("/test.tmp", FILE_WRITE);
@@ -282,11 +482,14 @@ void setup() {
         } else {
           consolePrintln("WARNING: SD Card write test failed");
           sdCardMounted = false;
+          SD.end();
         }
       } else {
         retries--;
+        speedIndex++;
         if (retries > 0) {
-          consolePrintf("SD Card mount failed, retrying... (%d attempts left)\n", retries);
+          consolePrintf("SD Card mount failed, retrying with different settings... (%d attempts left)\n", retries);
+          SD.end();
           delay(500);
         }
       }
@@ -294,7 +497,11 @@ void setup() {
 
     if (!sdCardMounted) {
       consolePrintln("ERROR: SD Card initialization failed after all retries!");
-      consolePrintln("Check: 1) Card inserted? 2) FAT32 format? 3) Wiring correct?");
+      consolePrintln("Check:");
+      consolePrintln("  1) Card inserted and seated properly?");
+      consolePrintln("  2) Card formatted as FAT32?");
+      consolePrintln("  3) Wiring: CS->2, MOSI->3, MISO->1, SCK->0");
+      consolePrintln("  4) Card not corrupted or damaged?");
       consolePrintln("Continuing without SD logging...");
     }
   } else {
@@ -363,6 +570,8 @@ void setup() {
   // This must be after SD card to prevent SPI conflicts
   consolePrintln("\n[7/7] Initializing Zigbee (IEEE 802.15.4)...");
   if (ENABLE_ZIGBEE_SCAN) {
+    consolePrintln("NOTE: You may see 'No Zigbee EPs to register' - this is NORMAL and expected");
+    consolePrintln("      We are using Zigbee for scanning only, not as a device.");
     // Note: Requires Arduino IDE settings:
     //   Tools -> Zigbee Mode -> Zigbee ZCZR (Coordinator/Router)
     //   Tools -> Partition Scheme -> Zigbee 4MB with spiffs
@@ -370,8 +579,7 @@ void setup() {
     Zigbee.setRebootOpenNetwork(0);  // Don't open network on reboot
     if (Zigbee.begin(ZIGBEE_ROUTER, false)) {
       zigbeeInitialized = true;
-      consolePrintln("Zigbee initialized (Router mode for scanning)");
-      consolePrintln("Note: 'No Zigbee EPs to register' warning is normal for scanning");
+      consolePrintln("Zigbee initialized successfully (Router mode for scanning)");
     } else {
       consolePrintln("WARNING: Zigbee initialization failed!");
       consolePrintln("Check Arduino IDE: Tools -> Zigbee Mode -> Zigbee ZCZR");
@@ -383,7 +591,15 @@ void setup() {
   // Wait for GPS signal before starting scans
   ledWaitingGPS();  // Orange: Waiting for GPS
   consolePrintln("\nWaiting for GPS signal...");
-  if (ENABLE_DISPLAY_OUTPUT) updateDisplay("Waiting for GPS");
+
+  // Initial display update (before tasks are started, no mutex needed)
+  if (ENABLE_DISPLAY_OUTPUT) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.println("Waiting for GPS");
+    display.display();
+  }
 
   unsigned long gpsWaitStart = millis();
   unsigned long lastGPSStatusUpdate = 0;
@@ -441,21 +657,126 @@ void setup() {
   consolePrintln("RTC synced from GPS time!");
 
   // Generate log filename now that we have valid time
+  consolePrintln("\nCreating log file...");
   if (ENABLE_LOG_OUTPUT && sdCardMounted) {
-    generateLogFileName();
-    logToFile("System started - SignalScout initialized");
-    logToFile("GPS signal acquired");
+    if (generateLogFileName()) {
+      logFileReady = true;
+      logToFile("System started - SignalScout initialized");
+      logToFile("GPS signal acquired");
+      consolePrintf("Logging to: %s\n", logFileName.c_str());
+    } else {
+      consolePrintln("ERROR: Failed to create log file!");
+      logFileReady = false;
+    }
+  } else {
+    consolePrintln("WARNING: SD card not mounted - logging disabled");
+    logFileReady = false;
   }
 
   // Setup complete
   ledReady();  // Green: Ready
-  consolePrintln("\nInitialization complete. Starting scans...\n");
-  if (sdCardMounted) {
-    logToFile("Initialization complete - entering main loop");
-    consolePrintf("Logging to: %s\n", logFileName.c_str());
+  consolePrintln("\nInitialization complete. Starting tasks...\n");
+
+  // Check available heap before creating tasks
+  consolePrintf("\nFree heap before task creation: %u bytes\n", ESP.getFreeHeap());
+  consolePrintf("Largest free block: %u bytes\n", ESP.getMaxAllocHeap());
+
+  // Create FreeRTOS tasks
+  consolePrintln("\nCreating FreeRTOS tasks...");
+
+  // SD Logger Task (only create if SD card is mounted and logging enabled)
+  if (ENABLE_LOG_OUTPUT && sdCardMounted && logFileReady) {
+    BaseType_t result = xTaskCreatePinnedToCore(
+      sdLogTask,           // Task function
+      "SD Logger",         // Task name
+      3072,                // Stack size (bytes) - reduced
+      NULL,                // Parameters
+      3,                   // Priority (0-24, higher = more priority)
+      &sdLogTaskHandle,    // Task handle
+      0                    // Core ID (0 or 1)
+    );
+    if (result != pdPASS) {
+      consolePrintln("ERROR: Failed to create SD Logger task!");
+    } else {
+      consolePrintln("SD Logger task created");
+    }
   } else {
-    consolePrintln("WARNING: SD card not mounted - logging disabled");
+    consolePrintln("SD Logger task skipped (SD card not ready)");
   }
+
+  // Display Task (high priority for responsive UI)
+  if (ENABLE_DISPLAY_OUTPUT) {
+    BaseType_t result = xTaskCreatePinnedToCore(
+      displayTask,         // Task function
+      "Display",           // Task name
+      2048,                // Stack size - reduced
+      NULL,                // Parameters
+      2,                   // Priority
+      &displayTaskHandle,  // Task handle
+      1                    // Core ID
+    );
+    if (result != pdPASS) {
+      consolePrintln("ERROR: Failed to create Display task!");
+    } else {
+      consolePrintln("Display task created");
+    }
+  }
+
+  // WiFi Scan Task
+  BaseType_t result = xTaskCreatePinnedToCore(
+    wifiScanTask,        // Task function
+    "WiFi Scanner",      // Task name
+    4096,                // Stack size (reduced from 8192)
+    NULL,                // Parameters
+    1,                   // Priority
+    &wifiScanTaskHandle, // Task handle
+    0                    // Core ID
+  );
+  if (result != pdPASS) {
+    consolePrintln("ERROR: Failed to create WiFi Scanner task!");
+  } else {
+    consolePrintln("WiFi Scanner task created");
+  }
+
+  // BLE Scan Task
+  result = xTaskCreatePinnedToCore(
+    bleScanTask,         // Task function
+    "BLE Scanner",       // Task name
+    4096,                // Stack size (reduced from 8192)
+    NULL,                // Parameters
+    1,                   // Priority
+    &bleScanTaskHandle,  // Task handle
+    0                    // Core ID
+  );
+  if (result != pdPASS) {
+    consolePrintln("ERROR: Failed to create BLE Scanner task!");
+  } else {
+    consolePrintln("BLE Scanner task created");
+  }
+
+  // Zigbee Scan Task
+  if (ENABLE_ZIGBEE_SCAN && zigbeeInitialized) {
+    result = xTaskCreatePinnedToCore(
+      zigbeeScanTask,        // Task function
+      "Zigbee Scanner",      // Task name
+      4096,                  // Stack size (reduced from 8192)
+      NULL,                  // Parameters
+      1,                     // Priority
+      &zigbeeScanTaskHandle, // Task handle
+      0                      // Core ID
+    );
+    if (result != pdPASS) {
+      consolePrintln("ERROR: Failed to create Zigbee Scanner task!");
+    } else {
+      consolePrintln("Zigbee Scanner task created");
+    }
+  }
+
+  consolePrintln("FreeRTOS task creation complete!");
+
+  // Check heap after task creation
+  consolePrintf("\nFree heap after task creation: %u bytes\n", ESP.getFreeHeap());
+  consolePrintf("Minimum free heap ever: %u bytes\n", ESP.getMinFreeHeap());
 
   // Brief pause to show green LED
   delay(1000);
@@ -463,10 +784,14 @@ void setup() {
   // Turn off LED to conserve battery
   setLEDOff();
   consolePrintln("Status LED turned off to conserve battery");
+  consolePrintln("\nEntering main loop (GPS monitoring and battery checks)...\n");
 }
 
 void loop() {
-  // Read GPS data
+  // Main loop now only handles GPS reading and battery monitoring
+  // All scanning and display updates are handled by FreeRTOS tasks
+
+  // Read GPS data continuously
   while (gpsSerial.available() > 0) {
     char c = gpsSerial.read();
     gps.encode(c);
@@ -490,25 +815,8 @@ void loop() {
     lastBatteryRead = currentTime;
   }
 
-  // Update display
-  if (ENABLE_DISPLAY_OUTPUT && currentTime - lastDisplayUpdate >= DISPLAY_UPDATE_INTERVAL) {
-    updateDisplay("");
-    lastDisplayUpdate = currentTime;
-  }
-
-  // Perform WiFi, BLE, and Zigbee scans together
-  if (currentTime - lastScan >= SCAN_INTERVAL) {
-    consolePrintf("\n[%lu] Starting scan cycle...\n", millis());
-    scanWiFi();
-    scanBluetooth();
-    if (ENABLE_ZIGBEE_SCAN && zigbeeInitialized) {
-      scanZigbee();
-    }
-    lastScan = currentTime;
-    consolePrintf("[%lu] Scan cycle complete\n", millis());
-  }
-
-  delay(100);
+  // Small delay to prevent tight loop
+  delay(50);
 }
 
 // Helper function to convert auth mode to string
@@ -600,11 +908,14 @@ void scanWiFi() {
              ap->bssid[0], ap->bssid[1], ap->bssid[2],
              ap->bssid[3], ap->bssid[4], ap->bssid[5]);
 
-    // Track unique devices by BSSID
-    std::string bssidKey(bssidStr);
-    if (seenWiFiDevices.find(bssidKey) == seenWiFiDevices.end()) {
-      seenWiFiDevices[bssidKey] = true;
-      uniqueWiFiCount++;
+    // Track unique devices by BSSID (with mutex protection)
+    if (xSemaphoreTake(deviceMapMutex, portMAX_DELAY) == pdTRUE) {
+      std::string bssidKey(bssidStr);
+      if (seenWiFiDevices.find(bssidKey) == seenWiFiDevices.end()) {
+        seenWiFiDevices[bssidKey] = true;
+        uniqueWiFiCount++;
+      }
+      xSemaphoreGive(deviceMapMutex);
     }
 
     // Determine frequency band based on channel
@@ -634,10 +945,22 @@ void scanWiFi() {
                   i + 1, ssid.c_str(), bssidStr, rssi, channel, band.c_str(),
                   encType.c_str(), fingerprintStr);
 
-    // Log to SD card - one line per device with GPS data
-    if (ENABLE_LOG_OUTPUT) {
-      logDeviceToFile("WIFI", ssid, String(bssidStr), String(rssi),
-                      String(channel), band, encType, fingerprintStr);
+    // Queue log entry for SD card writing (non-blocking)
+    if (ENABLE_LOG_OUTPUT && logFileReady) {
+      LogEntry entry;
+      strncpy(entry.type, "WIFI", sizeof(entry.type) - 1);
+      strncpy(entry.fingerprint, fingerprintStr, sizeof(entry.fingerprint) - 1);
+      strncpy(entry.param1, ssid.c_str(), sizeof(entry.param1) - 1);
+      strncpy(entry.param2, bssidStr, sizeof(entry.param2) - 1);
+      snprintf(entry.param3, sizeof(entry.param3), "%d", rssi);
+      snprintf(entry.param4, sizeof(entry.param4), "%d", channel);
+      strncpy(entry.param5, band.c_str(), sizeof(entry.param5) - 1);
+      strncpy(entry.param6, encType.c_str(), sizeof(entry.param6) - 1);
+
+      // Try to add to queue (don't block if queue is full)
+      if (xQueueSend(logQueue, &entry, 0) != pdTRUE) {
+        consolePrintln("WARNING: Log queue full, dropping WiFi entry");
+      }
     }
   }
 
@@ -663,11 +986,14 @@ void scanBluetooth() {
     String name = device.haveName() ? device.getName().c_str() : "Unknown";
     int rssi = device.getRSSI();
 
-    // Track unique devices by address
-    std::string addrKey = address.c_str();
-    if (seenBLEDevices.find(addrKey) == seenBLEDevices.end()) {
-      seenBLEDevices[addrKey] = true;
-      uniqueBLECount++;
+    // Track unique devices by address (with mutex protection)
+    if (xSemaphoreTake(deviceMapMutex, portMAX_DELAY) == pdTRUE) {
+      std::string addrKey = address.c_str();
+      if (seenBLEDevices.find(addrKey) == seenBLEDevices.end()) {
+        seenBLEDevices[addrKey] = true;
+        uniqueBLECount++;
+      }
+      xSemaphoreGive(deviceMapMutex);
     }
 
     // Get additional info
@@ -700,10 +1026,22 @@ void scanBluetooth() {
       consolePrintf("   Service UUID: %s\n", serviceUUID.c_str());
     }
 
-    // Log to SD card - one line per device with GPS data
-    if (ENABLE_LOG_OUTPUT) {
-      logDeviceToFile("BLE", name, address, String(rssi),
-                      manufData, serviceUUID, "", fingerprintStr);
+    // Queue log entry for SD card writing (non-blocking)
+    if (ENABLE_LOG_OUTPUT && logFileReady) {
+      LogEntry entry;
+      strncpy(entry.type, "BLE", sizeof(entry.type) - 1);
+      strncpy(entry.fingerprint, fingerprintStr, sizeof(entry.fingerprint) - 1);
+      strncpy(entry.param1, name.c_str(), sizeof(entry.param1) - 1);
+      strncpy(entry.param2, address.c_str(), sizeof(entry.param2) - 1);
+      snprintf(entry.param3, sizeof(entry.param3), "%d", rssi);
+      strncpy(entry.param4, manufData.c_str(), sizeof(entry.param4) - 1);
+      strncpy(entry.param5, serviceUUID.c_str(), sizeof(entry.param5) - 1);
+      entry.param6[0] = '\0';  // Not used for BLE
+
+      // Try to add to queue (don't block if queue is full)
+      if (xQueueSend(logQueue, &entry, 0) != pdTRUE) {
+        consolePrintln("WARNING: Log queue full, dropping BLE entry");
+      }
     }
   }
 
@@ -779,11 +1117,14 @@ void scanZigbee() {
     char panIdStr[8];
     snprintf(panIdStr, sizeof(panIdStr), "0x%04X", network->short_pan_id);
 
-    // Track unique networks by Extended PAN ID
-    std::string extPanIdKey(extPanIdStr);
-    if (seenZigbeeNetworks.find(extPanIdKey) == seenZigbeeNetworks.end()) {
-      seenZigbeeNetworks[extPanIdKey] = true;
-      uniqueZigbeeCount++;
+    // Track unique networks by Extended PAN ID (with mutex protection)
+    if (xSemaphoreTake(deviceMapMutex, portMAX_DELAY) == pdTRUE) {
+      std::string extPanIdKey(extPanIdStr);
+      if (seenZigbeeNetworks.find(extPanIdKey) == seenZigbeeNetworks.end()) {
+        seenZigbeeNetworks[extPanIdKey] = true;
+        uniqueZigbeeCount++;
+      }
+      xSemaphoreGive(deviceMapMutex);
     }
 
     // Get channel number
@@ -811,14 +1152,22 @@ void scanZigbee() {
                   routerCapacity ? "Yes" : "No",
                   endDeviceCapacity ? "Yes" : "No");
 
-    // Log to SD card
-    // Format: ZIGBEE,FP,Time,Lat,Lon,Alt,Sats,HDOP,PAN_ID,Ext_PAN_ID,Channel,PermitJoin,RouterCap,EDCap
-    if (ENABLE_LOG_OUTPUT) {
-      String joinStr = permitJoining ? "Yes" : "No";
-      String routerStr = routerCapacity ? "Yes" : "No";
-      String edStr = endDeviceCapacity ? "Yes" : "No";
-      logDeviceToFile("ZIGBEE", String(panIdStr), String(extPanIdStr), String(channel),
-                      joinStr, routerStr, edStr, fingerprintStr);
+    // Queue log entry for SD card writing (non-blocking)
+    if (ENABLE_LOG_OUTPUT && logFileReady) {
+      LogEntry entry;
+      strncpy(entry.type, "ZIGBEE", sizeof(entry.type) - 1);
+      strncpy(entry.fingerprint, fingerprintStr, sizeof(entry.fingerprint) - 1);
+      strncpy(entry.param1, panIdStr, sizeof(entry.param1) - 1);
+      strncpy(entry.param2, extPanIdStr, sizeof(entry.param2) - 1);
+      snprintf(entry.param3, sizeof(entry.param3), "%d", channel);
+      strncpy(entry.param4, permitJoining ? "Yes" : "No", sizeof(entry.param4) - 1);
+      strncpy(entry.param5, routerCapacity ? "Yes" : "No", sizeof(entry.param5) - 1);
+      strncpy(entry.param6, endDeviceCapacity ? "Yes" : "No", sizeof(entry.param6) - 1);
+
+      // Try to add to queue (don't block if queue is full)
+      if (xQueueSend(logQueue, &entry, 0) != pdTRUE) {
+        consolePrintln("WARNING: Log queue full, dropping Zigbee entry");
+      }
     }
   }
 
@@ -828,84 +1177,17 @@ void scanZigbee() {
   consolePrintln("--- Zigbee Scan Complete ---\n");
 }
 
-void logDeviceToFile(String deviceType, String param1, String param2, String param3,
-                     String param4, String param5, String param6, String fingerprint) {
-  if (!ENABLE_LOG_OUTPUT || !sdCardMounted) return;
-
-  File logFile = SD.open(logFileName.c_str(), FILE_APPEND);
-
-  if (!logFile) {
-    consolePrintln("ERROR: Failed to open log file for writing");
-    return;
-  }
-
-  String timestamp;
-  String gpsLat = "N/A";
-  String gpsLon = "N/A";
-  String gpsAlt = "N/A";
-  String gpsSats = "N/A";
-  String gpsHdop = "N/A";
-
-  // Get GPS time and location if available
-  if (gps.time.isValid() && gps.date.isValid()) {
-    char dateTime[32];
-    snprintf(dateTime, sizeof(dateTime), "%04d-%02d-%02d %02d:%02d:%02d",
-             gps.date.year(), gps.date.month(), gps.date.day(),
-             gps.time.hour(), gps.time.minute(), gps.time.second());
-    timestamp = String(dateTime);
-
-    if (gps.location.isValid()) {
-      gpsLat = String(gps.location.lat(), 6);
-      gpsLon = String(gps.location.lng(), 6);
-    }
-    if (gps.altitude.isValid()) {
-      gpsAlt = String(gps.altitude.meters(), 2);
-    }
-    if (gps.satellites.isValid()) {
-      gpsSats = String(gps.satellites.value());
-    }
-    if (gps.hdop.isValid()) {
-      gpsHdop = String(gps.hdop.hdop(), 2);
-    }
-  } else if (rtc.getYear() > 2020) {
-    // Fallback to RTC time if GPS not available
-    char dateTime[32];
-    snprintf(dateTime, sizeof(dateTime), "%04d-%02d-%02d %02d:%02d:%02d",
-             rtc.getYear(), rtc.getMonth() + 1, rtc.getDay(),
-             rtc.getHour(true), rtc.getMinute(), rtc.getSecond());
-    timestamp = String(dateTime) + " (RTC)";
-  } else {
-    timestamp = String(millis()) + "ms";
-  }
-
-  // Format: TYPE,Fingerprint,Timestamp,Lat,Lon,Alt,Sats,HDOP,Param1,Param2,Param3,Param4,Param5,Param6
-  String logEntry = deviceType + "," + fingerprint + "," + timestamp + "," +
-                    gpsLat + "," + gpsLon + "," + gpsAlt + "," + gpsSats + "," + gpsHdop + ",";
-
-  if (deviceType == "WIFI") {
-    // WIFI: SSID, BSSID, RSSI, Channel, Band, Encryption
-    logEntry += param1 + "," + param2 + "," + param3 + "," + param4 + "," + param5 + "," + param6;
-  } else if (deviceType == "BLE") {
-    // BLE: Name, Address, RSSI, ManufData, ServiceUUID
-    logEntry += param1 + "," + param2 + "," + param3 + "," + param4 + "," + param5;
-  } else if (deviceType == "ZIGBEE") {
-    // ZIGBEE: PAN_ID, Ext_PAN_ID, Channel, PermitJoin, RouterCap, EDCap
-    logEntry += param1 + "," + param2 + "," + param3 + "," + param4 + "," + param5 + "," + param6;
-  }
-
-  logFile.println(logEntry);
-  logFile.close();
-}
-
 void logToFile(String message) {
-  if (!ENABLE_LOG_OUTPUT || !sdCardMounted) return;
+  if (!ENABLE_LOG_OUTPUT || !sdCardMounted || !logFileReady) return;
 
-  File logFile = SD.open(logFileName.c_str(), FILE_APPEND);
+  if (xSemaphoreTake(sdCardMutex, portMAX_DELAY) == pdTRUE) {
+    File logFile = SD.open(logFileName.c_str(), FILE_APPEND);
 
-  if (!logFile) {
-    consolePrintln("ERROR: Failed to open log file for writing");
-    return;
-  }
+    if (!logFile) {
+      consolePrintln("ERROR: Failed to open log file for writing");
+      xSemaphoreGive(sdCardMutex);
+      return;
+    }
 
   String timestamp;
   String gpsData;
@@ -959,15 +1241,18 @@ void logToFile(String message) {
     gpsData = " | GPS: No fix";
   }
 
-  // Format: [timestamp] gpsData | message
-  String logEntry = "[" + timestamp + "]" + gpsData + " | " + message;
+    // Format: [timestamp] gpsData | message
+    String logEntry = "[" + timestamp + "]" + gpsData + " | " + message;
 
-  logFile.println(logEntry);
-  logFile.close();
+    logFile.println(logEntry);
+    logFile.close();
 
-  // Also print errors to serial for debugging
-  if (message.startsWith("ERROR")) {
-    consolePrintln(logEntry.c_str());
+    xSemaphoreGive(sdCardMutex);
+
+    // Also print errors to serial for debugging
+    if (message.startsWith("ERROR")) {
+      consolePrintln(logEntry.c_str());
+    }
   }
 }
 
@@ -1035,17 +1320,35 @@ void updateDisplay(String statusMessage) {
     // Show device statistics and countdown
     display.setTextSize(1);
 
+    // Read device counts with mutex protection
+    int wifi_last, ble_last, zigbee_last;
+    int wifi_total, ble_total, zigbee_total;
+
+    if (xSemaphoreTake(deviceMapMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+      wifi_last = lastWiFiScanCount;
+      ble_last = lastBLEScanCount;
+      zigbee_last = lastZigbeeScanCount;
+      wifi_total = uniqueWiFiCount;
+      ble_total = uniqueBLECount;
+      zigbee_total = uniqueZigbeeCount;
+      xSemaphoreGive(deviceMapMutex);
+    } else {
+      // Mutex timeout, use previous values
+      wifi_last = ble_last = zigbee_last = 0;
+      wifi_total = ble_total = zigbee_total = 0;
+    }
+
     // WiFi count: Last scan (Total)
     display.setCursor(2, 18);
-    display.printf("W:%d(%d)", lastWiFiScanCount, uniqueWiFiCount);
+    display.printf("W:%d(%d)", wifi_last, wifi_total);
 
     // BLE count: Last scan (Total)
     display.setCursor(2, 28);
-    display.printf("B:%d(%d)", lastBLEScanCount, uniqueBLECount);
+    display.printf("B:%d(%d)", ble_last, ble_total);
 
     // Zigbee count: Last scan (Total)
     display.setCursor(2, 38);
-    display.printf("Z:%d(%d)", lastZigbeeScanCount, uniqueZigbeeCount);
+    display.printf("Z:%d(%d)", zigbee_last, zigbee_total);
 
     // Draw animated WiFi logo in center-right of screen
     drawWiFiLogo(85, 18);

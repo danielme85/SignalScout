@@ -34,6 +34,22 @@ This is an Arduino sketch (.ino file) that should be developed using:
 
 ## Architecture
 
+**Multithreaded FreeRTOS Design:**
+The sketch uses FreeRTOS tasks for parallel execution, allowing simultaneous scanning and display updates without blocking. This significantly improves responsiveness and scan frequency.
+
+**FreeRTOS Tasks:**
+- **WiFi Scanner Task**: Scans WiFi networks in parallel (Core 0, Priority 1)
+- **BLE Scanner Task**: Scans Bluetooth devices in parallel (Core 0, Priority 1)
+- **Zigbee Scanner Task**: Scans Zigbee networks in parallel (Core 0, Priority 1)
+- **Display Task**: Updates OLED display every 1 second (Core 1, Priority 2)
+- **SD Logger Task**: Processes log queue and writes to SD card (Core 0, Priority 3)
+- **Main Loop**: GPS reading and battery monitoring
+
+**Thread Safety:**
+- **Mutexes**: Protect shared resources (device maps, SD card access, display)
+- **Queue System**: Non-blocking log entry queue (50 entries) prevents SD card write conflicts
+- **Task Staggering**: Scans start with 100ms, 300ms, and 500ms delays to distribute load
+
 The sketch is structured around five main components:
 
 1. **WiFi Scanner** (`scanWiFi()` function):
@@ -89,9 +105,12 @@ The sketch is structured around five main components:
    - Generates 8-character hexadecimal fingerprint for each device/network
    - Fingerprints used for device identification and tracking
 
-7. **SD Card Logger** (`logDeviceToFile()` and `logToFile()` functions):
-   - Creates unique log file on each boot with timestamp in filename
+7. **SD Card Logger** (`sdLogTask()` FreeRTOS task):
+   - Creates unique log file AFTER GPS lock or RTC time is available
    - Filename format: `/scan_YYYYMMDD_HHMMSS.txt` (using RTC time) or `/scan_boot_XXXXX.txt` (using millis if no RTC)
+   - File is created and opened in write mode, then closed - subsequent writes use FILE_APPEND mode
+   - Uses non-blocking queue system to prevent SD card write conflicts between scanning tasks
+   - Queue size: 50 entries, protected by mutex for thread-safe access
    - Each device logged on one line with complete GPS data
    - Format: `TYPE,Fingerprint,Timestamp,Lat,Lon,Alt,Sats,HDOP,DeviceParams...`
    - WiFi format: `WIFI,FP,Time,Lat,Lon,Alt,Sats,HDOP,SSID,BSSID,RSSI,Ch,Band,Enc`
@@ -99,6 +118,7 @@ The sketch is structured around five main components:
    - Zigbee format: `ZIGBEE,FP,Time,Lat,Lon,Alt,Sats,HDOP,PAN_ID,Ext_PAN_ID,Ch,PermitJoin,RouterCap,EDCap`
    - GPS data included with every device entry for location tracking
    - Falls back to RTC time when GPS not available (marked with "(RTC)" suffix)
+   - Dedicated SD logger task runs on Core 0 with highest priority (3) for reliable logging
 
 8. **Status LED** (WS2812B RGB LED on GPIO27):
    - Provides visual feedback during boot/setup process
@@ -148,11 +168,13 @@ Key settings defined at the top of the sketch:
   - Adjust `VOLTAGE_DIVIDER_RATIO` constant if using different resistor values
   - Battery thresholds: 3.0V (empty) to 4.2V (full)
 
-- **Display Update Interval**: 500ms
+- **Display Update Interval**: 1000ms (1 second)
+  - Display task runs independently on Core 1 for smooth updates
 
-- **Scan Interval**: 10 seconds
-  - WiFi, BLE, and Zigbee scans run together at the same interval
-  - Countdown timer on display shows seconds until next scan
+- **Scan Interval**: 1 second (per scan type)
+  - WiFi, BLE, and Zigbee scans run in parallel on separate FreeRTOS tasks
+  - Each scan type operates independently with staggered start times
+  - Non-blocking queue system for SD card logging
 
 - **BLE Scan Duration**: 5 seconds per scan
 
