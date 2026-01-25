@@ -34,10 +34,10 @@
 #include <stdarg.h>
 
 // SD Card SPI Pins (adjust these based on your wiring)
-#define SD_CS    2   // Chip Select
-#define SD_MOSI  3  // MOSI
-#define SD_MISO  1  // MISO
-#define SD_SCK   0  // SCK
+#define SD_CS    1  // Chip Select
+#define SD_MOSI  0  // MOSI
+#define SD_MISO  3  // MISO
+#define SD_SCK   2  // SCK
 
 // GPS UART Pins (adjust these based on your wiring)
 #define GPS_RX   14  // ESP32 RX pin (connects to GPS TX)
@@ -57,6 +57,11 @@
 #define LED_PIN      27      // WS2812B data pin
 #define LED_COUNT    1       // Number of LEDs
 
+// BOOT Button Pin for Light Sleep
+#define BOOT_BUTTON_PIN  28  // BOOT button GPIO
+#define SLEEP_HOLD_TIME  3000  // Hold for 3 seconds to enter light sleep (ms)
+#define WAKE_HOLD_TIME   1000  // Hold for 1 second to wake up (ms)
+
 // Battery ADC Pin
 #define BATTERY_PIN  6       // ADC pin for battery voltage
 #define BATTERY_SAMPLES 10   // Number of ADC samples to average
@@ -70,7 +75,7 @@
 #define VOLTAGE_DIVIDER_RATIO 3.0  // For 200k/100k voltage divider
 
 // Scan settings
-#define SCAN_INTERVAL 1  // WiFi, BLE, and Zigbee scan every second
+#define SCAN_INTERVAL 4  // WiFi, BLE, and Zigbee scan every x seconds
 #define BLE_SCAN_TIME 2      // BLE scan duration in seconds
 #define ZIGBEE_SCAN_DURATION 2  // Zigbee scan duration (1-14, higher = longer)
 
@@ -96,13 +101,11 @@ unsigned long lastDisplayUpdate = 0;
 TaskHandle_t wifiScanTaskHandle = NULL;
 TaskHandle_t bleScanTaskHandle = NULL;
 TaskHandle_t zigbeeScanTaskHandle = NULL;
-TaskHandle_t displayTaskHandle = NULL;
 TaskHandle_t sdLogTaskHandle = NULL;
 
 // FreeRTOS Semaphores and Mutexes
 SemaphoreHandle_t deviceMapMutex;
 SemaphoreHandle_t sdCardMutex;
-SemaphoreHandle_t displayMutex;
 
 // Queue for SD card logging (non-blocking)
 QueueHandle_t logQueue;
@@ -167,6 +170,10 @@ unsigned long lastBatteryRead = 0;
 
 // WiFi logo animation state (0 = dot only, 1-3 = number of rings)
 int wifiAnimationState = 0;
+
+// Deep sleep button state tracking
+unsigned long buttonPressStart = 0;
+bool buttonPressed = false;
 
 BLEScan* pBLEScan;
 
@@ -327,18 +334,6 @@ void zigbeeScanTask(void* parameter) {
   }
 }
 
-// FreeRTOS Task: Display Updater
-void displayTask(void* parameter) {
-  while (true) {
-    if (ENABLE_DISPLAY_OUTPUT) {
-      if (xSemaphoreTake(displayMutex, portMAX_DELAY) == pdTRUE) {
-        updateDisplay("");
-        xSemaphoreGive(displayMutex);
-      }
-    }
-    vTaskDelay(pdMS_TO_TICKS(DISPLAY_UPDATE_INTERVAL));
-  }
-}
 
 // FreeRTOS Task: SD Card Logger (processes queue)
 void sdLogTask(void* parameter) {
@@ -437,14 +432,17 @@ void setup() {
   consolePrintln("\n[0/7] Initializing FreeRTOS resources...");
   deviceMapMutex = xSemaphoreCreateMutex();
   sdCardMutex = xSemaphoreCreateMutex();
-  displayMutex = xSemaphoreCreateMutex();
   logQueue = xQueueCreate(LOG_QUEUE_SIZE, sizeof(LogEntry));
 
-  if (deviceMapMutex == NULL || sdCardMutex == NULL || displayMutex == NULL || logQueue == NULL) {
+  if (deviceMapMutex == NULL || sdCardMutex == NULL || logQueue == NULL) {
     consolePrintln("ERROR: Failed to create FreeRTOS resources!");
     while(1);  // Halt
   }
   consolePrintln("FreeRTOS mutexes and queue created successfully");
+
+  // Initialize BOOT button for light sleep
+  pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);  // BOOT button (active LOW)
+  consolePrintln("BOOT button initialized for light sleep (GPIO28)");
 
   // ============================================
   // CRITICAL: Initialize SD card FIRST before any radio initialization
@@ -686,14 +684,13 @@ void setup() {
 
   // SD Logger Task (only create if SD card is mounted and logging enabled)
   if (ENABLE_LOG_OUTPUT && sdCardMounted && logFileReady) {
-    BaseType_t result = xTaskCreatePinnedToCore(
+    BaseType_t result = xTaskCreate(
       sdLogTask,           // Task function
       "SD Logger",         // Task name
       3072,                // Stack size (bytes) - reduced
       NULL,                // Parameters
       3,                   // Priority (0-24, higher = more priority)
-      &sdLogTaskHandle,    // Task handle
-      0                    // Core ID (0 or 1)
+      &sdLogTaskHandle     // Task handle
     );
     if (result != pdPASS) {
       consolePrintln("ERROR: Failed to create SD Logger task!");
@@ -704,33 +701,14 @@ void setup() {
     consolePrintln("SD Logger task skipped (SD card not ready)");
   }
 
-  // Display Task (high priority for responsive UI)
-  if (ENABLE_DISPLAY_OUTPUT) {
-    BaseType_t result = xTaskCreatePinnedToCore(
-      displayTask,         // Task function
-      "Display",           // Task name
-      2048,                // Stack size - reduced
-      NULL,                // Parameters
-      2,                   // Priority
-      &displayTaskHandle,  // Task handle
-      1                    // Core ID
-    );
-    if (result != pdPASS) {
-      consolePrintln("ERROR: Failed to create Display task!");
-    } else {
-      consolePrintln("Display task created");
-    }
-  }
-
   // WiFi Scan Task
-  BaseType_t result = xTaskCreatePinnedToCore(
+  BaseType_t result = xTaskCreate(
     wifiScanTask,        // Task function
     "WiFi Scanner",      // Task name
     4096,                // Stack size (reduced from 8192)
     NULL,                // Parameters
     1,                   // Priority
-    &wifiScanTaskHandle, // Task handle
-    0                    // Core ID
+    &wifiScanTaskHandle  // Task handle
   );
   if (result != pdPASS) {
     consolePrintln("ERROR: Failed to create WiFi Scanner task!");
@@ -739,14 +717,13 @@ void setup() {
   }
 
   // BLE Scan Task
-  result = xTaskCreatePinnedToCore(
+  result = xTaskCreate(
     bleScanTask,         // Task function
     "BLE Scanner",       // Task name
     4096,                // Stack size (reduced from 8192)
     NULL,                // Parameters
     1,                   // Priority
-    &bleScanTaskHandle,  // Task handle
-    0                    // Core ID
+    &bleScanTaskHandle   // Task handle
   );
   if (result != pdPASS) {
     consolePrintln("ERROR: Failed to create BLE Scanner task!");
@@ -756,14 +733,13 @@ void setup() {
 
   // Zigbee Scan Task
   if (ENABLE_ZIGBEE_SCAN && zigbeeInitialized) {
-    result = xTaskCreatePinnedToCore(
+    result = xTaskCreate(
       zigbeeScanTask,        // Task function
       "Zigbee Scanner",      // Task name
       4096,                  // Stack size (reduced from 8192)
       NULL,                  // Parameters
       1,                     // Priority
-      &zigbeeScanTaskHandle, // Task handle
-      0                      // Core ID
+      &zigbeeScanTaskHandle  // Task handle
     );
     if (result != pdPASS) {
       consolePrintln("ERROR: Failed to create Zigbee Scanner task!");
@@ -784,12 +760,19 @@ void setup() {
   // Turn off LED to conserve battery
   setLEDOff();
   consolePrintln("Status LED turned off to conserve battery");
-  consolePrintln("\nEntering main loop (GPS monitoring and battery checks)...\n");
+
+  // Configure light sleep wakeup source (GPIO wakeup - BOOT button)
+  // Wake when GPIO28 goes LOW (button pressed)
+  gpio_wakeup_enable((gpio_num_t)BOOT_BUTTON_PIN, GPIO_INTR_LOW_LEVEL);
+  esp_sleep_enable_gpio_wakeup();
+  consolePrintln("Light sleep wakeup configured (hold BOOT button for 1 second to wake)");
+
+  consolePrintln("\nEntering main loop (GPS monitoring, battery checks, and display updates)...\n");
 }
 
 void loop() {
-  // Main loop now only handles GPS reading and battery monitoring
-  // All scanning and display updates are handled by FreeRTOS tasks
+  // Main loop handles GPS reading, battery monitoring, display updates, and light sleep
+  // All scanning is handled by FreeRTOS tasks
 
   // Read GPS data continuously
   while (gpsSerial.available() > 0) {
@@ -815,8 +798,95 @@ void loop() {
     lastBatteryRead = currentTime;
   }
 
+  // Update display periodically
+  if (ENABLE_DISPLAY_OUTPUT && currentTime - lastDisplayUpdate >= DISPLAY_UPDATE_INTERVAL) {
+    updateDisplay("");
+    lastDisplayUpdate = currentTime;
+  }
+
+  // Check for light sleep button press (BOOT button on GPIO28)
+  // Button is active LOW (pressed = LOW, released = HIGH)
+  bool currentButtonState = (digitalRead(BOOT_BUTTON_PIN) == LOW);
+
+  if (currentButtonState && !buttonPressed) {
+    // Button just pressed, start timing
+    buttonPressed = true;
+    buttonPressStart = millis();
+  } else if (currentButtonState && buttonPressed) {
+    // Button is being held, check if held long enough for sleep
+    unsigned long holdDuration = millis() - buttonPressStart;
+    if (holdDuration >= SLEEP_HOLD_TIME) {
+      // Enter light sleep
+      enterLightSleep();
+      // Note: After waking from light sleep, execution continues here
+      // Reset button state after wake
+      buttonPressed = false;
+    }
+  } else if (!currentButtonState && buttonPressed) {
+    // Button released
+    buttonPressed = false;
+  }
+
   // Small delay to prevent tight loop
   delay(50);
+}
+
+void enterLightSleep() {
+  consolePrintln("\n=== ENTERING LIGHT SLEEP ===");
+  consolePrintln("Hold BOOT button for 1 second to wake up");
+
+  // Show "Going to sleep" message on display
+  if (ENABLE_DISPLAY_OUTPUT) {
+    display.clearDisplay();
+    display.setTextSize(2);
+    display.setCursor(10, 20);
+    display.println("Going to");
+    display.setCursor(10, 40);
+    display.println("sleep...");
+    display.display();
+    delay(2000);  // Show message for 2 seconds
+
+    // Clear display before sleep
+    display.clearDisplay();
+    display.display();
+  }
+
+  // Log to SD card
+  if (ENABLE_LOG_OUTPUT && logFileReady) {
+    logToFile("Entering light sleep mode");
+  }
+
+  // Turn off status LED
+  setLEDOff();
+
+  // Flush serial output
+  Serial.flush();
+
+  // Enter light sleep (wake on BOOT button press - GPIO wakeup already configured in setup)
+  esp_light_sleep_start();
+
+  // Execution continues here after waking from light sleep
+  consolePrintln("\n=== WAKING FROM LIGHT SLEEP ===");
+
+  // Log wake event
+  if (ENABLE_LOG_OUTPUT && logFileReady) {
+    logToFile("Waking from light sleep mode");
+  }
+
+  // Re-enable LED briefly to show wake
+  setLEDColor(0, 255, 0);  // Green
+  delay(500);
+  setLEDOff();
+
+  // Update display
+  if (ENABLE_DISPLAY_OUTPUT) {
+    display.clearDisplay();
+    display.setTextSize(2);
+    display.setCursor(20, 20);
+    display.println("Awake!");
+    display.display();
+    delay(1000);
+  }
 }
 
 // Helper function to convert auth mode to string

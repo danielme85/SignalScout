@@ -20,6 +20,7 @@ Hardware requirements:
 - SSD1309 OLED display 128x64 connected via SPI
 - WS2812B RGB LED on GPIO27 (status indicator)
 - 3.7V LiPo battery (e.g., 3000mAh) with voltage divider on GPIO6 for monitoring
+- BOOT button on GPIO28 (for light sleep control)
 
 ## Development Environment
 
@@ -35,20 +36,25 @@ This is an Arduino sketch (.ino file) that should be developed using:
 ## Architecture
 
 **Multithreaded FreeRTOS Design:**
-The sketch uses FreeRTOS tasks for parallel execution, allowing simultaneous scanning and display updates without blocking. This significantly improves responsiveness and scan frequency.
+The sketch uses FreeRTOS tasks for concurrent execution on the ESP32-C5's single-core RISC-V CPU (240MHz). Tasks are scheduled cooperatively, allowing simultaneous scanning and display updates without blocking. This significantly improves responsiveness and scan frequency.
 
 **FreeRTOS Tasks:**
-- **WiFi Scanner Task**: Scans WiFi networks in parallel (Core 0, Priority 1)
-- **BLE Scanner Task**: Scans Bluetooth devices in parallel (Core 0, Priority 1)
-- **Zigbee Scanner Task**: Scans Zigbee networks in parallel (Core 0, Priority 1)
-- **Display Task**: Updates OLED display every 1 second (Core 1, Priority 2)
-- **SD Logger Task**: Processes log queue and writes to SD card (Core 0, Priority 3)
-- **Main Loop**: GPS reading and battery monitoring
+- **WiFi Scanner Task**: Scans WiFi networks (Priority 1)
+- **BLE Scanner Task**: Scans Bluetooth devices (Priority 1)
+- **Zigbee Scanner Task**: Scans Zigbee networks (Priority 1)
+- **SD Logger Task**: Processes log queue and writes to SD card (Priority 3 - highest priority for data integrity)
+- **Main Loop**: GPS reading, battery monitoring, display updates, and light sleep control
+
+**Single-Core Architecture:**
+- ESP32-C5 uses a 32-bit RISC-V single-core CPU operating at 240MHz
+- FreeRTOS scheduler handles task switching and time-slicing on the single core
+- Tasks are created with `xTaskCreate()` and scheduled based on priority
+- Higher priority tasks preempt lower priority tasks when ready to run
 
 **Thread Safety:**
 - **Mutexes**: Protect shared resources (device maps, SD card access, display)
 - **Queue System**: Non-blocking log entry queue (50 entries) prevents SD card write conflicts
-- **Task Staggering**: Scans start with 100ms, 300ms, and 500ms delays to distribute load
+- **Task Staggering**: Scans start with 100ms, 300ms, and 500ms delays to distribute load and prevent resource contention
 
 The sketch is structured around five main components:
 
@@ -136,6 +142,16 @@ The sketch is structured around five main components:
    - Displays battery icon with percentage on OLED
    - Battery level shown during GPS wait screen
 
+10. **Light Sleep Control** (`enterLightSleep()` function):
+   - BOOT button on GPIO28 controls light sleep mode
+   - Hold BOOT button for 3 seconds to enter light sleep (prevents accidental activation)
+   - Display shows "Going to sleep..." message before entering light sleep
+   - Device logs sleep event to SD card before sleeping
+   - Wake up by holding BOOT button for 1 second (GPIO wakeup on any GPIO pin)
+   - After waking, execution resumes from sleep point (no full restart required)
+   - RTC time persists across sleep cycles, providing immediate time availability
+   - Light sleep reduces power consumption significantly for battery-powered operation
+
 ## Configuration
 
 Key settings defined at the top of the sketch:
@@ -168,8 +184,14 @@ Key settings defined at the top of the sketch:
   - Adjust `VOLTAGE_DIVIDER_RATIO` constant if using different resistor values
   - Battery thresholds: 3.0V (empty) to 4.2V (full)
 
+- **BOOT Button Pin**: GPIO28
+  - Used for light sleep control (active LOW, internal pullup enabled)
+  - Hold for 3 seconds to enter light sleep mode
+  - Hold for 1 second to wake from light sleep
+  - Prevents accidental sleep activation while allowing easy wake
+
 - **Display Update Interval**: 1000ms (1 second)
-  - Display task runs independently on Core 1 for smooth updates
+  - Display updates handled in main loop with timing check
 
 - **Scan Interval**: 1 second (per scan type)
   - WiFi, BLE, and Zigbee scans run in parallel on separate FreeRTOS tasks
@@ -277,6 +299,17 @@ The display provides real-time visual feedback:
 - Serial monitor shows progress with satellite count updates
 - Once GPS fix acquired, LED turns green briefly, then off
 - Scanning begins automatically after GPS lock
+
+**Light Sleep Mode (Battery Conservation):**
+- Hold BOOT button (GPIO28) for 3 seconds to enter light sleep
+- Display shows "Going to sleep..." message before entering sleep mode
+- Device logs "Entering light sleep mode" to SD card before sleeping
+- In light sleep, power consumption is significantly reduced while maintaining system state
+- To wake up, hold BOOT button for 1 second
+- After waking, execution continues from sleep point (faster wake than deep sleep)
+- RTC time persists across sleep cycles, ensuring accurate timestamps resume immediately
+- GPS lock is maintained during light sleep (faster resumption of scanning)
+- Useful for battery-powered operation when not actively scanning
 
 **Log File Format:**
 
