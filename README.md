@@ -237,3 +237,6 @@ Open source - feel free to modify and share!
 ---
 
 **Built with ❤️ for wireless explorers and makers**
+
+
+![ScoutCat](signalscoutcat.gif)
