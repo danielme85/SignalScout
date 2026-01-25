@@ -4,6 +4,8 @@
 
 **A portable WiFi, Bluetooth, and Zigbee scanner with GPS tracking for ESP32-C5**
 
+![Logo](./Untiteled.jpeg)
+
 SignalScout is a wardriving and wireless reconnaissance tool that scans 2.4GHz and 5GHz WiFi networks, Bluetooth Low Energy (BLE) devices, and Zigbee networks (IEEE 802.15.4), logging everything to an SD card with precise GPS coordinates and timestamps.
 
 ## Features
