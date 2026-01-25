@@ -67,17 +67,17 @@
 #define BATTERY_SAMPLES 10   // Number of ADC samples to average
 
 // Battery voltage thresholds (3.7V LiPo)
-// Voltage divider: 200k (positive side) / 100k (to ground) = divides by 3
-// Full charge: 4.2V -> 1.4V at ADC
+// Voltage divider: 200k (positive side) / 100k (to ground) = divides by 3.333333
+// Full charge: 3.7V -> 1.4V at ADC
 // Empty: 3.0V -> 1.0V at ADC
-#define BATTERY_FULL_VOLTAGE 4.2
+#define BATTERY_FULL_VOLTAGE  3.7
 #define BATTERY_EMPTY_VOLTAGE 3.0
-#define VOLTAGE_DIVIDER_RATIO 3.0  // For 200k/100k voltage divider
+#define VOLTAGE_DIVIDER_RATIO 3.333333
 
 // Scan settings
-#define SCAN_INTERVAL 4  // WiFi, BLE, and Zigbee scan every x seconds
-#define BLE_SCAN_TIME 2      // BLE scan duration in seconds
-#define ZIGBEE_SCAN_DURATION 2  // Zigbee scan duration (1-14, higher = longer)
+#define SCAN_INTERVAL 10  // WiFi, BLE, and Zigbee scan every x seconds
+#define BLE_SCAN_TIME 3      // BLE scan duration in seconds
+#define ZIGBEE_SCAN_DURATION 5  // Zigbee scan duration (1-14, higher = longer, ~3 seconds)
 
 // Zigbee settings
 // Note: Requires Arduino IDE settings:
@@ -96,6 +96,21 @@
 unsigned long lastScan = 0;
 unsigned long lastDisplayUpdate = 0;
 #define DISPLAY_UPDATE_INTERVAL 1000  // Update display every 1000ms (1 second)
+
+// Active scanning flags (for display indicators)
+volatile bool wifiScanning = false;
+volatile bool bleScanning = false;
+volatile bool zigbeeScanning = false;
+
+// Cached device counts for display (reduces mutex contention)
+int cached_wifi_last = 0;
+int cached_ble_last = 0;
+int cached_zigbee_last = 0;
+int cached_wifi_total = 0;
+int cached_ble_total = 0;
+int cached_zigbee_total = 0;
+unsigned long lastCountsCacheUpdate = 0;
+#define COUNTS_CACHE_INTERVAL 200  // Update cached counts every 200ms
 
 // FreeRTOS Task Handles
 TaskHandle_t wifiScanTaskHandle = NULL;
@@ -183,6 +198,50 @@ class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
     // This will be called for each BLE device found during scan
   }
 };
+
+// Helper function to sanitize strings (remove non-printable ASCII and control characters)
+String sanitizeString(const String& input) {
+  String output = "";
+  output.reserve(input.length());
+
+  for (unsigned int i = 0; i < input.length(); i++) {
+    char c = input.charAt(i);
+    // Only keep printable ASCII characters (space through tilde: 32-126)
+    // Replace newlines, tabs, and other control characters with space
+    if (c >= 32 && c <= 126) {
+      output += c;
+    } else if (c == '\n' || c == '\r' || c == '\t') {
+      output += ' ';  // Replace whitespace control chars with space
+    }
+    // Skip all other non-printable/non-ASCII characters
+  }
+
+  // Trim trailing spaces
+  while (output.length() > 0 && output.charAt(output.length() - 1) == ' ') {
+    output.remove(output.length() - 1);
+  }
+
+  return output;
+}
+
+// Safe string copy with guaranteed null-termination and sanitization
+void safeCopy(char* dest, size_t destSize, const String& src) {
+  if (destSize == 0) return;
+
+  String sanitized = sanitizeString(src);
+  size_t len = sanitized.length();
+  if (len >= destSize) {
+    len = destSize - 1;  // Leave room for null terminator
+  }
+
+  // Copy characters
+  for (size_t i = 0; i < len; i++) {
+    dest[i] = sanitized.charAt(i);
+  }
+
+  // Always null-terminate
+  dest[len] = '\0';
+}
 
 // Helper function for console output
 void consolePrint(const char* msg) {
@@ -284,7 +343,60 @@ bool generateLogFileName() {
     File logFile = SD.open(logFileName.c_str(), FILE_WRITE);
     if (logFile) {
       logFile.println("=== SignalScout Log File ===");
-      logFile.println("Format: TYPE,Fingerprint,Timestamp,Lat,Lon,Alt,Sats,HDOP,DeviceParams...");
+      logFile.println("GPS-timestamped WiFi, Bluetooth, and Zigbee scan results");
+      logFile.println();
+      logFile.println("=== Column Headers ===");
+      logFile.println();
+      logFile.println("WIFI Format:");
+      logFile.println("Type,Fingerprint,Timestamp,Latitude,Longitude,Altitude,Satellites,HDOP,SSID,BSSID,RSSI,Channel,Band,Encryption");
+      logFile.println();
+      logFile.println("BLE Format:");
+      logFile.println("Type,Fingerprint,Timestamp,Latitude,Longitude,Altitude,Satellites,HDOP,Name,Address,RSSI,ManufacturerData,ServiceUUID");
+      logFile.println();
+      logFile.println("ZIGBEE Format:");
+      logFile.println("Type,Fingerprint,Timestamp,Latitude,Longitude,Altitude,Satellites,HDOP,PAN_ID,ExtendedPAN_ID,Channel,PermitJoin,RouterCapacity,EndDeviceCapacity");
+      logFile.println();
+      logFile.println("=== Field Descriptions ===");
+      logFile.println();
+      logFile.println("Fingerprint: 8-character hexadecimal unique device/network identifier (based on MAC/PAN ID)");
+      logFile.println("Timestamp: UTC time from GPS (YYYY-MM-DD HH:MM:SS) or RTC time with (RTC) suffix");
+      logFile.println("Latitude: GPS latitude in decimal degrees (positive = North, negative = South)");
+      logFile.println("Longitude: GPS longitude in decimal degrees (positive = East, negative = West)");
+      logFile.println("Altitude: Elevation in meters above sea level");
+      logFile.println("Satellites: Number of GPS satellites visible");
+      logFile.println("HDOP: Horizontal Dilution of Precision (lower = better accuracy, <2 is good)");
+      logFile.println();
+      logFile.println("WiFi-specific:");
+      logFile.println("  SSID: Network name (may be <hidden> for hidden networks)");
+      logFile.println("  BSSID: Access point MAC address (XX:XX:XX:XX:XX:XX)");
+      logFile.println("  RSSI: Received signal strength in dBm (higher = stronger, typical range -30 to -90)");
+      logFile.println("  Channel: WiFi channel number (1-14 for 2.4GHz, 32+ for 5GHz)");
+      logFile.println("  Band: Frequency band (2.4GHz or 5GHz)");
+      logFile.println("  Encryption: Security type (OPEN, WEP, WPA-PSK, WPA2-PSK, WPA3-PSK, etc.)");
+      logFile.println();
+      logFile.println("BLE-specific:");
+      logFile.println("  Name: Bluetooth device name (or Unknown if not advertised)");
+      logFile.println("  Address: Bluetooth MAC address (xx:xx:xx:xx:xx:xx)");
+      logFile.println("  RSSI: Received signal strength in dBm (higher = stronger)");
+      logFile.println("  ManufacturerData: Hexadecimal manufacturer-specific data (if present)");
+      logFile.println("  ServiceUUID: Advertised service UUID (if present)");
+      logFile.println();
+      logFile.println("Zigbee-specific:");
+      logFile.println("  PAN_ID: 16-bit Personal Area Network identifier (0x0000-0xFFFF)");
+      logFile.println("  ExtendedPAN_ID: 64-bit unique network identifier (XX:XX:XX:XX:XX:XX:XX:XX)");
+      logFile.println("  Channel: Zigbee channel (11-26, all in 2.4GHz band)");
+      logFile.println("  PermitJoin: Whether network accepts new devices (Yes/No)");
+      logFile.println("  RouterCapacity: Whether network can accept more routers (Yes/No)");
+      logFile.println("  EndDeviceCapacity: Whether network can accept more end devices (Yes/No)");
+      logFile.println();
+      logFile.println("=== Example Entries ===");
+      logFile.println();
+      logFile.println("WIFI,3C7B6E95,2026-01-24 22:57:04,41.342822,-81.389317,327.20,8,1.34,MyHomeNetwork,60:B7:6E:6D:99:95,-45,6,2.4GHz,WPA2-PSK");
+      logFile.println("BLE,FA2FAF58,2026-01-24 22:57:16,41.342820,-81.389308,327.90,8,1.34,Smart Watch,58:D9:FA:AF:2F:FD,-65,4C001005,0000180A");
+      logFile.println("ZIGBEE,8A3F5C12,2026-01-24 22:57:28,41.342818,-81.389299,328.10,8,1.34,0x1A2B,00:11:22:33:44:55:66:77,15,Yes,Yes,No");
+      logFile.println();
+      logFile.println("=== Scan Data Begins ===");
+      logFile.println();
       logFile.close();
       consolePrintf("Log file created successfully: %s\n", logFileName.c_str());
       xSemaphoreGive(sdCardMutex);
@@ -300,37 +412,43 @@ bool generateLogFileName() {
 
 // FreeRTOS Task: WiFi Scanner
 void wifiScanTask(void* parameter) {
-  vTaskDelay(pdMS_TO_TICKS(100));  // Initial stagger delay
+  vTaskDelay(pdMS_TO_TICKS(0));  // No initial delay - WiFi scans first
   while (true) {
     if (logFileReady) {
       consolePrintf("\n[WiFi Task] Starting WiFi scan at %lu ms\n", millis());
+      wifiScanning = true;
       scanWiFi();
+      wifiScanning = false;
     }
-    vTaskDelay(pdMS_TO_TICKS(SCAN_INTERVAL * 1000));  // Convert to milliseconds
+    vTaskDelay(pdMS_TO_TICKS(SCAN_INTERVAL * 1000));  // Wait 10 seconds between scans
   }
 }
 
 // FreeRTOS Task: Bluetooth Scanner
 void bleScanTask(void* parameter) {
-  vTaskDelay(pdMS_TO_TICKS(300));  // Initial stagger delay (offset from WiFi)
+  vTaskDelay(pdMS_TO_TICKS(3500));  // Start after WiFi finishes (~3s scan + 0.5s buffer)
   while (true) {
     if (logFileReady) {
       consolePrintf("\n[BLE Task] Starting BLE scan at %lu ms\n", millis());
+      bleScanning = true;
       scanBluetooth();
+      bleScanning = false;
     }
-    vTaskDelay(pdMS_TO_TICKS(SCAN_INTERVAL * 1000));  // Convert to milliseconds
+    vTaskDelay(pdMS_TO_TICKS(SCAN_INTERVAL * 1000));  // Wait 10 seconds between scans
   }
 }
 
 // FreeRTOS Task: Zigbee Scanner
 void zigbeeScanTask(void* parameter) {
-  vTaskDelay(pdMS_TO_TICKS(500));  // Initial stagger delay (offset from WiFi and BLE)
+  vTaskDelay(pdMS_TO_TICKS(7000));  // Start after BLE finishes (~6.5s + 0.5s buffer)
   while (true) {
     if (logFileReady && ENABLE_ZIGBEE_SCAN && zigbeeInitialized) {
       consolePrintf("\n[Zigbee Task] Starting Zigbee scan at %lu ms\n", millis());
+      zigbeeScanning = true;
       scanZigbee();
+      zigbeeScanning = false;
     }
-    vTaskDelay(pdMS_TO_TICKS(SCAN_INTERVAL * 1000));  // Convert to milliseconds
+    vTaskDelay(pdMS_TO_TICKS(SCAN_INTERVAL * 1000));  // Wait 10 seconds between scans
   }
 }
 
@@ -774,23 +892,39 @@ void loop() {
   // Main loop handles GPS reading, battery monitoring, display updates, and light sleep
   // All scanning is handled by FreeRTOS tasks
 
-  // Read GPS data continuously
-  while (gpsSerial.available() > 0) {
+  unsigned long currentTime = millis();
+
+  // Read GPS data continuously (limit reads to prevent blocking)
+  int gpsReadCount = 0;
+  while (gpsSerial.available() > 0 && gpsReadCount < 100) {
     char c = gpsSerial.read();
     gps.encode(c);
+    gpsReadCount++;
   }
 
   // Periodically update RTC from GPS (every ~60 seconds) to keep it accurate
   if (gps.time.isValid() && gps.date.isValid()) {
     static unsigned long lastRTCSync = 0;
-    if (millis() - lastRTCSync > 60000) {
+    if (currentTime - lastRTCSync > 60000) {
       rtc.setTime(gps.time.second(), gps.time.minute(), gps.time.hour(),
                   gps.date.day(), gps.date.month(), gps.date.year());
-      lastRTCSync = millis();
+      lastRTCSync = currentTime;
     }
   }
 
-  unsigned long currentTime = millis();
+  // Update cached device counts periodically (reduces mutex contention during display updates)
+  if (currentTime - lastCountsCacheUpdate >= COUNTS_CACHE_INTERVAL) {
+    if (xSemaphoreTake(deviceMapMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+      cached_wifi_last = lastWiFiScanCount;
+      cached_ble_last = lastBLEScanCount;
+      cached_zigbee_last = lastZigbeeScanCount;
+      cached_wifi_total = uniqueWiFiCount;
+      cached_ble_total = uniqueBLECount;
+      cached_zigbee_total = uniqueZigbeeCount;
+      xSemaphoreGive(deviceMapMutex);
+      lastCountsCacheUpdate = currentTime;
+    }
+  }
 
   // Update battery reading periodically
   if (currentTime - lastBatteryRead >= BATTERY_READ_INTERVAL) {
@@ -798,7 +932,7 @@ void loop() {
     lastBatteryRead = currentTime;
   }
 
-  // Update display periodically
+  // Update display periodically - GUARANTEED to run every second
   if (ENABLE_DISPLAY_OUTPUT && currentTime - lastDisplayUpdate >= DISPLAY_UPDATE_INTERVAL) {
     updateDisplay("");
     lastDisplayUpdate = currentTime;
@@ -811,10 +945,10 @@ void loop() {
   if (currentButtonState && !buttonPressed) {
     // Button just pressed, start timing
     buttonPressed = true;
-    buttonPressStart = millis();
+    buttonPressStart = currentTime;
   } else if (currentButtonState && buttonPressed) {
     // Button is being held, check if held long enough for sleep
-    unsigned long holdDuration = millis() - buttonPressStart;
+    unsigned long holdDuration = currentTime - buttonPressStart;
     if (holdDuration >= SLEEP_HOLD_TIME) {
       // Enter light sleep
       enterLightSleep();
@@ -827,8 +961,8 @@ void loop() {
     buttonPressed = false;
   }
 
-  // Small delay to prevent tight loop
-  delay(50);
+  // Minimal delay to prevent tight loop but maintain responsiveness (10ms = 100Hz loop)
+  delay(10);
 }
 
 void enterLightSleep() {
@@ -908,6 +1042,7 @@ void scanWiFi() {
   consolePrintln("\n--- WiFi Scan Starting (2.4GHz + 5GHz) ---");
 
   // Use ESP-IDF scan API directly to avoid WIFI_BAND_MODE_AUTO issues
+  // Scan time settings adjusted for ~3 second total scan time
   wifi_scan_config_t scan_config = {
     .ssid = NULL,
     .bssid = NULL,
@@ -916,10 +1051,10 @@ void scanWiFi() {
     .scan_type = WIFI_SCAN_TYPE_ACTIVE,
     .scan_time = {
       .active = {
-        .min = 100,
-        .max = 300
+        .min = 120,  // Minimum scan time per channel (ms)
+        .max = 150   // Maximum scan time per channel (ms) - increased for ~3s total
       },
-      .passive = 300
+      .passive = 400  // Passive scan time per channel (ms)
     }
   };
 
@@ -1001,12 +1136,17 @@ void scanWiFi() {
     // Get encryption type string
     String encType = getAuthModeString(authMode);
 
-    // Generate fingerprint (simple hash)
-    String fingerprintData = String(bssidStr) + ssid + encType;
+    // Generate fingerprint using BSSID only (stable hardware identifier)
+    // This ensures the same device always gets the same fingerprint
     uint32_t fingerprint = 0;
-    for (unsigned int j = 0; j < fingerprintData.length(); j++) {
-      fingerprint = fingerprint * 31 + fingerprintData.charAt(j);
+    for (int j = 0; j < 6; j++) {
+      fingerprint = (fingerprint << 8) | ap->bssid[j];
     }
+    // Add more entropy by rotating the bits
+    fingerprint = (fingerprint ^ (fingerprint >> 16)) * 0x45d9f3b;
+    fingerprint = (fingerprint ^ (fingerprint >> 16)) * 0x45d9f3b;
+    fingerprint = fingerprint ^ (fingerprint >> 16);
+
     char fingerprintStr[9];
     snprintf(fingerprintStr, sizeof(fingerprintStr), "%08X", fingerprint);
 
@@ -1018,14 +1158,18 @@ void scanWiFi() {
     // Queue log entry for SD card writing (non-blocking)
     if (ENABLE_LOG_OUTPUT && logFileReady) {
       LogEntry entry;
-      strncpy(entry.type, "WIFI", sizeof(entry.type) - 1);
-      strncpy(entry.fingerprint, fingerprintStr, sizeof(entry.fingerprint) - 1);
-      strncpy(entry.param1, ssid.c_str(), sizeof(entry.param1) - 1);
-      strncpy(entry.param2, bssidStr, sizeof(entry.param2) - 1);
+      // Zero out the entire structure first to ensure no garbage
+      memset(&entry, 0, sizeof(LogEntry));
+
+      // Use safe copy functions with guaranteed null-termination
+      safeCopy(entry.type, sizeof(entry.type), "WIFI");
+      safeCopy(entry.fingerprint, sizeof(entry.fingerprint), fingerprintStr);
+      safeCopy(entry.param1, sizeof(entry.param1), ssid);
+      safeCopy(entry.param2, sizeof(entry.param2), bssidStr);
       snprintf(entry.param3, sizeof(entry.param3), "%d", rssi);
       snprintf(entry.param4, sizeof(entry.param4), "%d", channel);
-      strncpy(entry.param5, band.c_str(), sizeof(entry.param5) - 1);
-      strncpy(entry.param6, encType.c_str(), sizeof(entry.param6) - 1);
+      safeCopy(entry.param5, sizeof(entry.param5), band);
+      safeCopy(entry.param6, sizeof(entry.param6), encType);
 
       // Try to add to queue (don't block if queue is full)
       if (xQueueSend(logQueue, &entry, 0) != pdTRUE) {
@@ -1070,20 +1214,36 @@ void scanBluetooth() {
     String manufData = "";
     String serviceUUID = "";
     if (device.haveManufacturerData()) {
-      manufData = device.getManufacturerData().c_str();
+      // Get raw manufacturer data as hex string (sanitized)
+      String rawData = device.getManufacturerData();
+      char hexStr[65] = {0};  // Limit to 32 bytes (64 hex chars + null)
+      for (size_t i = 0; i < rawData.length() && i < 32; i++) {
+        snprintf(hexStr + (i * 2), 3, "%02X", (uint8_t)rawData[i]);
+      }
+      manufData = String(hexStr);
     }
     if (device.haveServiceUUID()) {
       serviceUUID = device.getServiceUUID().toString().c_str();
     }
 
-    // Generate fingerprint
-    String fingerprintData = address + name + manufData;
-    uint32_t fingerprint = 0;
-    for (int j = 0; j < fingerprintData.length(); j++) {
-      fingerprint = fingerprint * 31 + fingerprintData.charAt(j);
+    // Generate fingerprint using BLE address only (stable hardware identifier)
+    // Parse MAC address string (format: "xx:xx:xx:xx:xx:xx")
+    char fingerprintStr[9] = "00000000";  // Default if parsing fails
+    uint8_t macBytes[6] = {0};
+    if (sscanf(address.c_str(), "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+               &macBytes[0], &macBytes[1], &macBytes[2],
+               &macBytes[3], &macBytes[4], &macBytes[5]) == 6) {
+      uint32_t fingerprint = 0;
+      for (int j = 0; j < 6; j++) {
+        fingerprint = (fingerprint << 8) | macBytes[j];
+      }
+      // Add entropy
+      fingerprint = (fingerprint ^ (fingerprint >> 16)) * 0x45d9f3b;
+      fingerprint = (fingerprint ^ (fingerprint >> 16)) * 0x45d9f3b;
+      fingerprint = fingerprint ^ (fingerprint >> 16);
+
+      snprintf(fingerprintStr, sizeof(fingerprintStr), "%08X", fingerprint);
     }
-    char fingerprintStr[9];
-    snprintf(fingerprintStr, sizeof(fingerprintStr), "%08X", fingerprint);
 
     // Print to Serial
     consolePrintf("%d: %s | RSSI: %d dBm | Addr: %s | FP: %s\n",
@@ -1099,14 +1259,17 @@ void scanBluetooth() {
     // Queue log entry for SD card writing (non-blocking)
     if (ENABLE_LOG_OUTPUT && logFileReady) {
       LogEntry entry;
-      strncpy(entry.type, "BLE", sizeof(entry.type) - 1);
-      strncpy(entry.fingerprint, fingerprintStr, sizeof(entry.fingerprint) - 1);
-      strncpy(entry.param1, name.c_str(), sizeof(entry.param1) - 1);
-      strncpy(entry.param2, address.c_str(), sizeof(entry.param2) - 1);
+      // Zero out the entire structure first to ensure no garbage
+      memset(&entry, 0, sizeof(LogEntry));
+
+      // Use safe copy functions with guaranteed null-termination
+      safeCopy(entry.type, sizeof(entry.type), "BLE");
+      safeCopy(entry.fingerprint, sizeof(entry.fingerprint), fingerprintStr);
+      safeCopy(entry.param1, sizeof(entry.param1), name);
+      safeCopy(entry.param2, sizeof(entry.param2), address);
       snprintf(entry.param3, sizeof(entry.param3), "%d", rssi);
-      strncpy(entry.param4, manufData.c_str(), sizeof(entry.param4) - 1);
-      strncpy(entry.param5, serviceUUID.c_str(), sizeof(entry.param5) - 1);
-      entry.param6[0] = '\0';  // Not used for BLE
+      safeCopy(entry.param4, sizeof(entry.param4), manufData);
+      safeCopy(entry.param5, sizeof(entry.param5), serviceUUID);
 
       // Try to add to queue (don't block if queue is full)
       if (xQueueSend(logQueue, &entry, 0) != pdTRUE) {
@@ -1205,12 +1368,17 @@ void scanZigbee() {
     bool routerCapacity = network->router_capacity;
     bool endDeviceCapacity = network->end_device_capacity;
 
-    // Generate fingerprint from Extended PAN ID and PAN ID
-    String fingerprintData = String(extPanIdStr) + String(panIdStr);
+    // Generate fingerprint from Extended PAN ID only (stable network identifier)
+    // Use the 8-byte Extended PAN ID directly
     uint32_t fingerprint = 0;
-    for (unsigned int j = 0; j < fingerprintData.length(); j++) {
-      fingerprint = fingerprint * 31 + fingerprintData.charAt(j);
+    for (int j = 0; j < 8; j++) {
+      fingerprint = (fingerprint << 8) | network->extended_pan_id[j];
     }
+    // Add entropy
+    fingerprint = (fingerprint ^ (fingerprint >> 16)) * 0x45d9f3b;
+    fingerprint = (fingerprint ^ (fingerprint >> 16)) * 0x45d9f3b;
+    fingerprint = fingerprint ^ (fingerprint >> 16);
+
     char fingerprintStr[9];
     snprintf(fingerprintStr, sizeof(fingerprintStr), "%08X", fingerprint);
 
@@ -1225,14 +1393,18 @@ void scanZigbee() {
     // Queue log entry for SD card writing (non-blocking)
     if (ENABLE_LOG_OUTPUT && logFileReady) {
       LogEntry entry;
-      strncpy(entry.type, "ZIGBEE", sizeof(entry.type) - 1);
-      strncpy(entry.fingerprint, fingerprintStr, sizeof(entry.fingerprint) - 1);
-      strncpy(entry.param1, panIdStr, sizeof(entry.param1) - 1);
-      strncpy(entry.param2, extPanIdStr, sizeof(entry.param2) - 1);
+      // Zero out the entire structure first to ensure no garbage
+      memset(&entry, 0, sizeof(LogEntry));
+
+      // Use safe copy functions with guaranteed null-termination
+      safeCopy(entry.type, sizeof(entry.type), "ZIGBEE");
+      safeCopy(entry.fingerprint, sizeof(entry.fingerprint), fingerprintStr);
+      safeCopy(entry.param1, sizeof(entry.param1), panIdStr);
+      safeCopy(entry.param2, sizeof(entry.param2), extPanIdStr);
       snprintf(entry.param3, sizeof(entry.param3), "%d", channel);
-      strncpy(entry.param4, permitJoining ? "Yes" : "No", sizeof(entry.param4) - 1);
-      strncpy(entry.param5, routerCapacity ? "Yes" : "No", sizeof(entry.param5) - 1);
-      strncpy(entry.param6, endDeviceCapacity ? "Yes" : "No", sizeof(entry.param6) - 1);
+      safeCopy(entry.param4, sizeof(entry.param4), permitJoining ? "Yes" : "No");
+      safeCopy(entry.param5, sizeof(entry.param5), routerCapacity ? "Yes" : "No");
+      safeCopy(entry.param6, sizeof(entry.param6), endDeviceCapacity ? "Yes" : "No");
 
       // Try to add to queue (don't block if queue is full)
       if (xQueueSend(logQueue, &entry, 0) != pdTRUE) {
@@ -1390,35 +1562,38 @@ void updateDisplay(String statusMessage) {
     // Show device statistics and countdown
     display.setTextSize(1);
 
-    // Read device counts with mutex protection
-    int wifi_last, ble_last, zigbee_last;
-    int wifi_total, ble_total, zigbee_total;
+    // Use cached device counts (updated in main loop every 200ms)
+    // This prevents display lag from mutex contention with scanning tasks
+    int wifi_last = cached_wifi_last;
+    int ble_last = cached_ble_last;
+    int zigbee_last = cached_zigbee_last;
+    int wifi_total = cached_wifi_total;
+    int ble_total = cached_ble_total;
+    int zigbee_total = cached_zigbee_total;
 
-    if (xSemaphoreTake(deviceMapMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-      wifi_last = lastWiFiScanCount;
-      ble_last = lastBLEScanCount;
-      zigbee_last = lastZigbeeScanCount;
-      wifi_total = uniqueWiFiCount;
-      ble_total = uniqueBLECount;
-      zigbee_total = uniqueZigbeeCount;
-      xSemaphoreGive(deviceMapMutex);
+    // WiFi count: Last scan (Total) - add asterisk when scanning
+    display.setCursor(2, 18);
+    if (wifiScanning) {
+      display.printf("W:%d(%d)*", wifi_last, wifi_total);
     } else {
-      // Mutex timeout, use previous values
-      wifi_last = ble_last = zigbee_last = 0;
-      wifi_total = ble_total = zigbee_total = 0;
+      display.printf("W:%d(%d)", wifi_last, wifi_total);
     }
 
-    // WiFi count: Last scan (Total)
-    display.setCursor(2, 18);
-    display.printf("W:%d(%d)", wifi_last, wifi_total);
-
-    // BLE count: Last scan (Total)
+    // BLE count: Last scan (Total) - add asterisk when scanning
     display.setCursor(2, 28);
-    display.printf("B:%d(%d)", ble_last, ble_total);
+    if (bleScanning) {
+      display.printf("B:%d(%d)*", ble_last, ble_total);
+    } else {
+      display.printf("B:%d(%d)", ble_last, ble_total);
+    }
 
-    // Zigbee count: Last scan (Total)
+    // Zigbee count: Last scan (Total) - add asterisk when scanning
     display.setCursor(2, 38);
-    display.printf("Z:%d(%d)", zigbee_last, zigbee_total);
+    if (zigbeeScanning) {
+      display.printf("Z:%d(%d)*", zigbee_last, zigbee_total);
+    } else {
+      display.printf("Z:%d(%d)", zigbee_last, zigbee_total);
+    }
 
     // Draw animated WiFi logo in center-right of screen
     drawWiFiLogo(85, 18);

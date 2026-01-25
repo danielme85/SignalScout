@@ -39,11 +39,11 @@ This is an Arduino sketch (.ino file) that should be developed using:
 The sketch uses FreeRTOS tasks for concurrent execution on the ESP32-C5's single-core RISC-V CPU (240MHz). Tasks are scheduled cooperatively, allowing simultaneous scanning and display updates without blocking. This significantly improves responsiveness and scan frequency.
 
 **FreeRTOS Tasks:**
-- **WiFi Scanner Task**: Scans WiFi networks (Priority 1)
-- **BLE Scanner Task**: Scans Bluetooth devices (Priority 1)
-- **Zigbee Scanner Task**: Scans Zigbee networks (Priority 1)
+- **WiFi Scanner Task**: Scans WiFi networks every 10 seconds (~3 second duration, Priority 1)
+- **BLE Scanner Task**: Scans Bluetooth devices every 10 seconds (~3 second duration, Priority 1)
+- **Zigbee Scanner Task**: Scans Zigbee networks every 10 seconds (~3 second duration, Priority 1)
 - **SD Logger Task**: Processes log queue and writes to SD card (Priority 3 - highest priority for data integrity)
-- **Main Loop**: GPS reading, battery monitoring, display updates, and light sleep control
+- **Main Loop**: GPS reading (continuous), battery monitoring, display updates (every 1 second), and light sleep control
 
 **Single-Core Architecture:**
 - ESP32-C5 uses a 32-bit RISC-V single-core CPU operating at 240MHz
@@ -51,10 +51,14 @@ The sketch uses FreeRTOS tasks for concurrent execution on the ESP32-C5's single
 - Tasks are created with `xTaskCreate()` and scheduled based on priority
 - Higher priority tasks preempt lower priority tasks when ready to run
 
-**Thread Safety:**
+**Thread Safety & Task Staggering:**
 - **Mutexes**: Protect shared resources (device maps, SD card access, display)
 - **Queue System**: Non-blocking log entry queue (50 entries) prevents SD card write conflicts
-- **Task Staggering**: Scans start with 100ms, 300ms, and 500ms delays to distribute load and prevent resource contention
+- **Staggered Scanning**: Tasks run sequentially every 10 seconds to prevent resource contention:
+  - WiFi: Starts at t=0s (no delay), runs for ~3 seconds
+  - BLE: Starts at t=3.5s (3500ms delay), runs for ~3 seconds
+  - Zigbee: Starts at t=7s (7000ms delay), runs for ~3 seconds
+  - This ensures smooth GPS updates and display rendering throughout the scan cycle
 
 The sketch is structured around five main components:
 
@@ -94,13 +98,15 @@ The sketch is structured around five main components:
    - RTC time persists across reboots, allowing immediate time availability on boot
 
 5. **OLED Display** (`updateDisplay()` function):
-   - Updates every 500ms with real-time GPS and system status
+   - Updates every 1 second with real-time GPS and system status
    - **Top Left**: Satellite signal strength indicator with icon and bars (0-5 bars based on satellite count)
    - **Top Center**: Battery indicator with icon showing charge level and percentage
    - **Top Right**: Degree heading (000-359°) and compass direction (N, NE, E, SE, S, SW, W, NW)
    - **Center Left**: Device counts - WiFi "W:X(XX)", BLE "B:X(XX)", Zigbee "Z:X(XX)"
+     - Asterisk (*) appears after count when actively scanning (e.g., "W:5(23)*")
+     - Shows last scan count and total unique devices seen
    - **Center Right**: Countdown timer "Scan in: Xs" showing seconds until next scan
-   - **Bottom Left**: GPS time in HH:MM:SS UTC format (2px left margin)
+   - **Bottom Left**: GPS time in HH:MM:SS UTC format (2px left margin, updates every second)
    - **Bottom Right**: Speed in both MPH and KPH (2px right margin, right-aligned)
    - All display elements use consistent 2px margins on left and right edges
 
@@ -180,8 +186,9 @@ Key settings defined at the top of the sketch:
   - Automatically turns off when main loop starts
 
 - **Battery ADC Pin**: GPIO6
-  - Connect via voltage divider (100k/100k recommended for 3.7V LiPo)
-  - Adjust `VOLTAGE_DIVIDER_RATIO` constant if using different resistor values
+  - Connect via voltage divider (200k/100k for 3.7V LiPo)
+  - `VOLTAGE_DIVIDER_RATIO` set to 3.333333 for 200k/100k divider
+  - Adjust constant if using different resistor values
   - Battery thresholds: 3.0V (empty) to 4.2V (full)
 
 - **BOOT Button Pin**: GPIO28
@@ -192,15 +199,22 @@ Key settings defined at the top of the sketch:
 
 - **Display Update Interval**: 1000ms (1 second)
   - Display updates handled in main loop with timing check
+  - GPS data read continuously in main loop (non-blocking)
 
-- **Scan Interval**: 1 second (per scan type)
-  - WiFi, BLE, and Zigbee scans run in parallel on separate FreeRTOS tasks
-  - Each scan type operates independently with staggered start times
-  - Non-blocking queue system for SD card logging
+- **Scan Interval**: 10 seconds (full scan cycle)
+  - WiFi, BLE, and Zigbee scans run sequentially on separate FreeRTOS tasks
+  - Staggered timing prevents resource contention and ensures smooth display updates:
+    - WiFi: Starts at t=0s, ~3 second duration
+    - BLE: Starts at t=3.5s, ~3 second duration
+    - Zigbee: Starts at t=7s, ~3 second duration
+  - Non-blocking queue system for SD card logging after each scan completes
+  - Active scanning flags (`wifiScanning`, `bleScanning`, `zigbeeScanning`) trigger asterisk display
 
-- **BLE Scan Duration**: 5 seconds per scan
+- **BLE Scan Duration**: 3 seconds per scan
 
-- **Zigbee Scan Duration**: 5 (scan duration setting 1-14, higher = longer)
+- **Zigbee Scan Duration**: 5 (scan duration setting 1-14, approximately 3 seconds)
+
+- **WiFi Scan Duration**: ~3 seconds (per-channel timing: 120-150ms active, 400ms passive)
 
 - **Zigbee Mode** (Arduino IDE setting required):
   - **ED (End Device)**: Recommended for scanning - passive, low-power operation
@@ -279,15 +293,16 @@ Monitor serial output at 115200 baud to see scan results in real-time.
 - **Off**: Main loop running (LED turned off to conserve battery)
 
 **OLED Display:**
-The display provides real-time visual feedback:
+The display provides real-time visual feedback (updates every 1 second):
 - **Top Left**: Satellite icon with signal bars showing GPS satellite count (1-5 bars)
 - **Top Center**: Battery indicator with icon and percentage
 - **Top Right**: Degree heading (000-359°) followed by compass direction (N, NE, E, SE, S, SW, W, NW) based on GPS course (requires movement >1 km/h)
 - **Center Left**: Device counts showing "W:X(XX)" for WiFi, "B:X(XX)" for BLE, and "Z:X(XX)" for Zigbee
   - First number = devices/networks found in last scan
   - Number in parentheses = total unique devices/networks seen since startup
+  - **Asterisk (*)** appears when actively scanning (e.g., "W:5(23)*" during WiFi scan)
 - **Center Right**: Countdown timer "Scan in: Xs" showing seconds until next scan
-- **Bottom Left**: Current UTC time from GPS (HH:MM:SS format)
+- **Bottom Left**: Current UTC time from GPS (HH:MM:SS format, updates every second)
 - **Bottom Right**: Current speed from GPS (format: "XXM YYK" for MPH and KPH, right-aligned)
 
 **GPS Acquisition (Required Before Scanning):**
@@ -298,7 +313,12 @@ The display provides real-time visual feedback:
 - May take 30-60 seconds outdoors for initial fix
 - Serial monitor shows progress with satellite count updates
 - Once GPS fix acquired, LED turns green briefly, then off
-- Scanning begins automatically after GPS lock
+- Scanning begins automatically after GPS lock in 10-second cycles:
+  - WiFi scan starts immediately (~3 seconds)
+  - BLE scan starts 3.5 seconds later (~3 seconds)
+  - Zigbee scan starts 7 seconds later (~3 seconds)
+  - Cycle repeats every 10 seconds
+- Asterisk indicator shows which scanner is currently active
 
 **Light Sleep Mode (Battery Conservation):**
 - Hold BOOT button (GPIO28) for 3 seconds to enter light sleep
@@ -317,48 +337,106 @@ Each boot creates a unique log file with timestamp in the filename:
 - With RTC time: `/scan_YYYYMMDD_HHMMSS.txt` (e.g., `/scan_20260121_153045.txt`)
 - Without RTC time: `/scan_boot_XXXXX.txt` (e.g., `/scan_boot_1234.txt`)
 
-Each file contains one line per device with complete GPS data.
+Each file begins with a comprehensive header explaining column formats and field descriptions, followed by one line per device with complete GPS data.
 
-**WiFi Entry Format:**
-```
-WIFI,XXXXXXXX,YYYY-MM-DD HH:MM:SS,Lat,Lon,Alt,Sats,HDOP,SSID,BSSID,RSSI,Channel,Band,Encryption
-```
+**Column Headers:**
 
-**BLE Entry Format:**
+WiFi Format:
 ```
-BLE,XXXXXXXX,YYYY-MM-DD HH:MM:SS,Lat,Lon,Alt,Sats,HDOP,Name,Address,RSSI,ManufData,ServiceUUID
+Type,Fingerprint,Timestamp,Latitude,Longitude,Altitude,Satellites,HDOP,SSID,BSSID,RSSI,Channel,Band,Encryption
 ```
 
-**Zigbee Entry Format:**
+BLE Format:
 ```
-ZIGBEE,XXXXXXXX,YYYY-MM-DD HH:MM:SS,Lat,Lon,Alt,Sats,HDOP,PAN_ID,Ext_PAN_ID,Channel,PermitJoin,RouterCap,EDCap
-```
-
-Where:
-- `XXXXXXXX` = 8-character hexadecimal device fingerprint
-- GPS coordinates, altitude, satellite count, and HDOP included with every device
-- When GPS fix unavailable but RTC time exists, timestamp shows RTC time with "(RTC)" suffix
-- When neither GPS nor RTC available, timestamp shows milliseconds and GPS fields show "N/A"
-
-**Example WiFi Entry:**
-```
-WIFI,A3F2C891,2026-01-21 15:30:45,37.774929,-122.419418,15.50,8,1.20,MyNetwork,AA:BB:CC:DD:EE:FF,-65,6,2.4GHz,WPA2-PSK
+Type,Fingerprint,Timestamp,Latitude,Longitude,Altitude,Satellites,HDOP,Name,Address,RSSI,ManufacturerData,ServiceUUID
 ```
 
-**Example BLE Entry:**
+Zigbee Format:
 ```
-BLE,B7E4D123,2026-01-21 15:30:46,37.774930,-122.419420,15.52,8,1.20,MyDevice,12:34:56:78:9A:BC,-72,ManufData,ServiceUUID
-```
-
-**Example Zigbee Entry:**
-```
-ZIGBEE,C8D5E234,2026-01-21 15:30:47,37.774931,-122.419422,15.54,8,1.20,0x1A2B,00:11:22:33:44:55:66:77,15,Yes,Yes,Yes
+Type,Fingerprint,Timestamp,Latitude,Longitude,Altitude,Satellites,HDOP,PAN_ID,ExtendedPAN_ID,Channel,PermitJoin,RouterCapacity,EndDeviceCapacity
 ```
 
-Where Zigbee fields are:
-- `PAN_ID` = 16-bit network identifier (e.g., 0x1A2B)
-- `Ext_PAN_ID` = 64-bit extended PAN ID (8 bytes, colon-separated)
-- `Channel` = Zigbee channel number (11-26)
-- `PermitJoin` = Whether network is accepting new devices (Yes/No)
-- `RouterCap` = Router capacity available (Yes/No)
-- `EDCap` = End device capacity available (Yes/No)
+**Common Field Descriptions:**
+
+- **Type**: Entry type (WIFI, BLE, or ZIGBEE)
+- **Fingerprint**: 8-character hexadecimal unique identifier derived from device MAC address or network Extended PAN ID
+  - WiFi: Based on BSSID (access point MAC address)
+  - BLE: Based on Bluetooth MAC address
+  - Zigbee: Based on Extended PAN ID
+  - Same device/network always gets same fingerprint (stable identifier)
+- **Timestamp**: UTC time from GPS in format `YYYY-MM-DD HH:MM:SS`
+  - Appends `(RTC)` suffix when using RTC fallback time
+  - Shows milliseconds if neither GPS nor RTC available
+- **Latitude**: GPS latitude in decimal degrees (positive = North, negative = South)
+- **Longitude**: GPS longitude in decimal degrees (positive = East, negative = West)
+- **Altitude**: Elevation in meters above sea level from GPS
+- **Satellites**: Number of GPS satellites currently visible
+- **HDOP**: Horizontal Dilution of Precision - GPS accuracy indicator
+  - Lower values = better accuracy
+  - <2.0 = Good, 2-5 = Moderate, >5 = Poor
+
+**WiFi-Specific Fields:**
+
+- **SSID**: Network name (shows `<hidden>` for hidden networks)
+- **BSSID**: Access point MAC address in format `XX:XX:XX:XX:XX:XX`
+- **RSSI**: Received Signal Strength Indicator in dBm
+  - Higher (less negative) = stronger signal
+  - Typical range: -30 dBm (excellent) to -90 dBm (weak)
+- **Channel**: WiFi channel number
+  - Channels 1-14: 2.4GHz band
+  - Channels 32+: 5GHz band
+- **Band**: Frequency band (`2.4GHz` or `5GHz`)
+- **Encryption**: Security type
+  - Examples: `OPEN`, `WEP`, `WPA-PSK`, `WPA2-PSK`, `WPA3-PSK`, `WPA2/WPA3-PSK`, `WPA2-ENT`
+
+**BLE-Specific Fields:**
+
+- **Name**: Bluetooth device name as advertised (shows `Unknown` if not provided)
+- **Address**: Bluetooth MAC address in format `xx:xx:xx:xx:xx:xx`
+- **RSSI**: Received Signal Strength Indicator in dBm (higher = stronger)
+- **ManufacturerData**: Hexadecimal representation of manufacturer-specific advertising data
+  - Format: Raw bytes as hex string (e.g., `4C001005` for Apple)
+  - Empty if not advertised
+- **ServiceUUID**: Primary service UUID advertised by device
+  - Format: Standard UUID (e.g., `0000180A` for Device Information Service)
+  - Empty if not advertised
+
+**Zigbee-Specific Fields:**
+
+- **PAN_ID**: 16-bit Personal Area Network identifier in hexadecimal (e.g., `0x1A2B`)
+  - Range: 0x0000 to 0xFFFF
+  - Used for basic network identification
+- **ExtendedPAN_ID**: 64-bit globally unique network identifier
+  - Format: 8 bytes as colon-separated hex (e.g., `00:11:22:33:44:55:66:77`)
+  - Globally unique, never changes for a network
+- **Channel**: Zigbee radio channel (11-26)
+  - All Zigbee channels are in 2.4GHz band
+  - Channel spacing: 5 MHz
+- **PermitJoin**: Whether network currently accepts new devices joining (`Yes` or `No`)
+- **RouterCapacity**: Whether network can accept additional router devices (`Yes` or `No`)
+- **EndDeviceCapacity**: Whether network can accept additional end devices (`Yes` or `No`)
+
+**Example Entries:**
+
+WiFi (Home router on 2.4GHz):
+```
+WIFI,3C7B6E95,2026-01-24 22:57:04,41.342822,-81.389317,327.20,8,1.34,MyHomeNetwork,60:B7:6E:6D:99:95,-45,6,2.4GHz,WPA2-PSK
+```
+
+BLE (Smart watch):
+```
+BLE,FA2FAF58,2026-01-24 22:57:16,41.342820,-81.389308,327.90,8,1.34,Smart Watch,58:D9:FA:AF:2F:FD,-65,4C001005,0000180A
+```
+
+Zigbee (Smart home hub):
+```
+ZIGBEE,8A3F5C12,2026-01-24 22:57:28,41.342818,-81.389299,328.10,8,1.34,0x1A2B,00:11:22:33:44:55:66:77,15,Yes,Yes,No
+```
+
+**Data Quality Notes:**
+
+- All strings (SSID, BLE names) are sanitized to printable ASCII characters only
+- Non-printable characters, control codes, and extended UTF-8 are removed
+- BLE manufacturer data is converted to clean hexadecimal representation
+- All log entries are guaranteed null-terminated with no garbage characters
+- CSV format allows easy import into spreadsheets, databases, or GIS tools
