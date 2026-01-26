@@ -48,28 +48,33 @@ For different resistor values, adjust `VOLTAGE_DIVIDER_RATIO` in the code.
 
 ## Display Layout
 
+The OLED display provides real-time visual feedback, updating every 1 second:
+
 ```
 ┌──────────────────────────────────────────────┐
-│ 📡5 ▂▄▆█  [██░]85  065° NE                  │  ← Satellites + battery + compass
+│ 📡▂▄▆█     [██░░]85%        065° NE         │  ← GPS satellites | Battery | Compass
 ├──────────────────────────────────────────────┤
-│ W:12(47)*                   Scan in:         │  ← WiFi devices (last scan/total) + active indicator
-│ B:8(23)                           5s         │  ← BLE devices + countdown timer
-│ Z:2(5)                                       │  ← Zigbee networks (last scan/total)
+│ W:12(47)*              Scan in: 5s           │  ← WiFi: last(total)*
+│ B:8(23)                                      │  ← BLE: last(total)
+│ Z:2(5)                                       │  ← Zigbee: last(total)
 ├──────────────────────────────────────────────┤
-│ 14:23:57                       45M 72K       │  ← GPS time (UTC) + speed (MPH/KPH)
+│ 14:23:57                       45M 72K       │  ← GPS time (UTC) | Speed (MPH/KPH)
 └──────────────────────────────────────────────┘
 ```
 
 ### Display Elements
 
 - **Top Left:** Satellite icon with signal strength bars (0-5 bars based on satellite count)
-- **Top Center:** Battery indicator with icon and percentage
-- **Top Right:** Heading in degrees and compass direction (N, NE, E, SE, S, SW, W, NW)
-- **Center Left:** Device counters - W (WiFi), B (BLE), Z (Zigbee) with last scan/total counts
-  - **Asterisk (*)** appears after count when that scanner is actively scanning
-- **Center Right:** Countdown timer showing seconds until next scan
-- **Bottom Left:** Current UTC time from GPS (updates every second)
-- **Bottom Right:** Current speed in both MPH and KPH
+- **Top Center:** Battery indicator with icon and percentage (updates every 5 seconds)
+- **Top Right:** Degree heading (000-359°) and compass direction (N, NE, E, SE, S, SW, W, NW)
+  - Requires movement >1 km/h to display compass bearing
+- **Center Left:** Device counters showing format "W:X(XX)", "B:X(XX)", "Z:X(XX)"
+  - First number = devices/networks found in last scan
+  - Number in parentheses = total unique devices/networks seen since boot
+  - **Asterisk (*)** appears when actively scanning (e.g., "W:5(23)*" during WiFi scan)
+- **Center Right:** Countdown timer "Scan in: Xs" showing seconds until next scan cycle
+- **Bottom Left:** Current UTC time from GPS in HH:MM:SS format (2px left margin, updates every second)
+- **Bottom Right:** Current speed in MPH and KPH format "XXM YYK" (2px right margin, right-aligned)
 
 ## Quick Start Guide
 
