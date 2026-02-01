@@ -31,7 +31,7 @@ This is an Arduino sketch (.ino file) that should be developed using:
 
 ## File Structure
 
-- `WifiScanner.ino` - Main Arduino sketch with WiFi/BLE scanning and SD card logging
+- `SignalScout.ino` - Main Arduino sketch with WiFi/BLE/Zigbee scanning and SD card logging
 
 ## Architecture
 
@@ -162,11 +162,15 @@ The sketch is structured around five main components:
 
 Key settings defined at the top of the sketch:
 
+- **Scanner Flags**:
+  - `ENABLE_WIFI_SCAN`: Enable/disable WiFi network scanning (default: true)
+  - `ENABLE_BLE_SCAN`: Enable/disable Bluetooth Low Energy scanning (default: true)
+  - `ENABLE_ZIGBEE_SCAN`: Enable/disable Zigbee network scanning (default: true)
+
 - **Output Flags**:
   - `ENABLE_CONSOLE_OUTPUT`: Enable/disable serial console output (default: true). Set to `false` in production to save processing time.
   - `ENABLE_DISPLAY_OUTPUT`: Enable/disable OLED display (default: true)
   - `ENABLE_LOG_OUTPUT`: Enable/disable SD card logging (default: true)
-  - `ENABLE_ZIGBEE_SCAN`: Enable/disable Zigbee network scanning (default: true)
 
 - **SD Card SPI Pins**: CS=5, MOSI=23, MISO=19, SCK=18
   - Adjust these to match your SD card module wiring
@@ -224,7 +228,7 @@ Key settings defined at the top of the sketch:
 
 ## Arduino-Specific Constraints
 
-- The main file must have the same name as the parent directory (WifiScanner)
+- The main file must have the same name as the parent directory (SignalScout)
 - Arduino sketches require `setup()` function (runs once on boot) and `loop()` function (runs repeatedly)
 - When adding WiFi functionality, use the appropriate WiFi library for the target board (e.g., `WiFi.h` for ESP32/ESP8266, `WiFiNINA.h` for Arduino boards with WiFi capabilities)
 - Serial communication for debugging uses `Serial.begin()` in setup and `Serial.print()`/`Serial.println()` in loop
@@ -243,10 +247,10 @@ Key settings defined at the top of the sketch:
 arduino-cli core install esp32:esp32
 
 # Compile the sketch
-arduino-cli compile --fqbn esp32:esp32:esp32c5 WifiScanner
+arduino-cli compile --fqbn esp32:esp32:esp32c5 SignalScout
 
 # Upload to board
-arduino-cli upload -p /dev/ttyUSB0 --fqbn esp32:esp32:esp32c5 WifiScanner
+arduino-cli upload -p /dev/ttyUSB0 --fqbn esp32:esp32:esp32c5 SignalScout
 
 # Monitor serial output
 arduino-cli monitor -p /dev/ttyUSB0 -c baudrate=115200

@@ -32,6 +32,9 @@
 #include <Adafruit_NeoPixel.h>
 #include <Zigbee.h>
 #include <stdarg.h>
+#include "secrets.h"
+// File sharing via WiFi (install ESPAsyncWebServer and AsyncTCP libraries)
+#include <ESPAsyncWebServer.h>
 
 // SD Card SPI Pins (adjust these based on your wiring)
 #define SD_CS    1  // Chip Select
@@ -57,10 +60,10 @@
 #define LED_PIN      27      // WS2812B data pin
 #define LED_COUNT    1       // Number of LEDs
 
-// BOOT Button Pin for Light Sleep
-#define BOOT_BUTTON_PIN  28  // BOOT button GPIO
-#define SLEEP_HOLD_TIME  3000  // Hold for 3 seconds to enter light sleep (ms)
-#define WAKE_HOLD_TIME   1000  // Hold for 1 second to wake up (ms)
+// Multi-function Button Pin (File Share / Deep Sleep)
+#define SHARE_BUTTON_PIN  7     // GPIO for file share / sleep button
+#define SHARE_HOLD_TIME   1000  // Hold for 1 second to toggle file sharing (ms)
+#define SLEEP_HOLD_TIME   3000  // Hold for 3 seconds to enter deep sleep (ms)
 
 // Battery ADC Pin
 #define BATTERY_PIN  6       // ADC pin for battery voltage
@@ -87,8 +90,12 @@
 // The "Network steering was not successful" warning is normal and can be ignored
 #define ENABLE_ZIGBEE_SCAN true  // Enable/disable Zigbee scanning
 
+// Scanner enable/disable flags
+#define ENABLE_WIFI_SCAN true    // Enable/disable WiFi scanning
+#define ENABLE_BLE_SCAN true     // Enable/disable Bluetooth scanning
+
 // Output enable/disable flags
-#define ENABLE_CONSOLE_OUTPUT false   // Enable/disable serial console output
+#define ENABLE_CONSOLE_OUTPUT true   // Enable/disable serial console output
 #define ENABLE_DISPLAY_OUTPUT true   // Enable/disable OLED display output
 #define ENABLE_LOG_OUTPUT true       // Enable/disable SD card logging
 
@@ -182,6 +189,12 @@ Adafruit_NeoPixel statusLED(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
 int batteryPercent = 0;
 unsigned long lastBatteryRead = 0;
 #define BATTERY_READ_INTERVAL 5000  // Read battery every 5 seconds
+
+// File sharing mode
+bool fileSharingMode = false;
+String fileSharingIP;
+AsyncWebServer server(80);
+bool serverRoutesConfigured = false;
 
 // WiFi logo animation state (0 = dot only, 1-3 = number of rings)
 int wifiAnimationState = 0;
@@ -291,6 +304,10 @@ void ledReady() {
   setLEDColor(0, 255, 0);  // Green: Setup complete, ready
 }
 
+void ledFileSharing() {
+  setLEDColor(0, 100, 255);  // Blue: File sharing mode
+}
+
 // Read battery voltage and calculate percentage
 int readBatteryPercent() {
   // Take multiple samples for stability
@@ -356,47 +373,6 @@ bool generateLogFileName() {
       logFile.println("ZIGBEE Format:");
       logFile.println("Type,Fingerprint,Timestamp,Latitude,Longitude,Altitude,Satellites,HDOP,PAN_ID,ExtendedPAN_ID,Channel,PermitJoin,RouterCapacity,EndDeviceCapacity");
       logFile.println();
-      logFile.println("=== Field Descriptions ===");
-      logFile.println();
-      logFile.println("Fingerprint: 8-character hexadecimal unique device/network identifier (based on MAC/PAN ID)");
-      logFile.println("Timestamp: UTC time from GPS (YYYY-MM-DD HH:MM:SS) or RTC time with (RTC) suffix");
-      logFile.println("Latitude: GPS latitude in decimal degrees (positive = North, negative = South)");
-      logFile.println("Longitude: GPS longitude in decimal degrees (positive = East, negative = West)");
-      logFile.println("Altitude: Elevation in meters above sea level");
-      logFile.println("Satellites: Number of GPS satellites visible");
-      logFile.println("HDOP: Horizontal Dilution of Precision (lower = better accuracy, <2 is good)");
-      logFile.println();
-      logFile.println("WiFi-specific:");
-      logFile.println("  SSID: Network name (may be <hidden> for hidden networks)");
-      logFile.println("  BSSID: Access point MAC address (XX:XX:XX:XX:XX:XX)");
-      logFile.println("  RSSI: Received signal strength in dBm (higher = stronger, typical range -30 to -90)");
-      logFile.println("  Channel: WiFi channel number (1-14 for 2.4GHz, 32+ for 5GHz)");
-      logFile.println("  Band: Frequency band (2.4GHz or 5GHz)");
-      logFile.println("  Encryption: Security type (OPEN, WEP, WPA-PSK, WPA2-PSK, WPA3-PSK, etc.)");
-      logFile.println();
-      logFile.println("BLE-specific:");
-      logFile.println("  Name: Bluetooth device name (or Unknown if not advertised)");
-      logFile.println("  Address: Bluetooth MAC address (xx:xx:xx:xx:xx:xx)");
-      logFile.println("  RSSI: Received signal strength in dBm (higher = stronger)");
-      logFile.println("  ManufacturerData: Hexadecimal manufacturer-specific data (if present)");
-      logFile.println("  ServiceUUID: Advertised service UUID (if present)");
-      logFile.println();
-      logFile.println("Zigbee-specific:");
-      logFile.println("  PAN_ID: 16-bit Personal Area Network identifier (0x0000-0xFFFF)");
-      logFile.println("  ExtendedPAN_ID: 64-bit unique network identifier (XX:XX:XX:XX:XX:XX:XX:XX)");
-      logFile.println("  Channel: Zigbee channel (11-26, all in 2.4GHz band)");
-      logFile.println("  PermitJoin: Whether network accepts new devices (Yes/No)");
-      logFile.println("  RouterCapacity: Whether network can accept more routers (Yes/No)");
-      logFile.println("  EndDeviceCapacity: Whether network can accept more end devices (Yes/No)");
-      logFile.println();
-      logFile.println("=== Example Entries ===");
-      logFile.println();
-      logFile.println("WIFI,3C7B6E95,2026-01-24 22:57:04,41.342822,-81.389317,327.20,8,1.34,MyHomeNetwork,60:B7:6E:6D:99:95,-45,6,2.4GHz,WPA2-PSK");
-      logFile.println("BLE,FA2FAF58,2026-01-24 22:57:16,41.342820,-81.389308,327.90,8,1.34,Smart Watch,58:D9:FA:AF:2F:FD,-65,4C001005,0000180A");
-      logFile.println("ZIGBEE,8A3F5C12,2026-01-24 22:57:28,41.342818,-81.389299,328.10,8,1.34,0x1A2B,00:11:22:33:44:55:66:77,15,Yes,Yes,No");
-      logFile.println();
-      logFile.println("=== Scan Data Begins ===");
-      logFile.println();
       logFile.close();
       consolePrintf("Log file created successfully: %s\n", logFileName.c_str());
       xSemaphoreGive(sdCardMutex);
@@ -414,7 +390,7 @@ bool generateLogFileName() {
 void wifiScanTask(void* parameter) {
   vTaskDelay(pdMS_TO_TICKS(0));  // No initial delay - WiFi scans first
   while (true) {
-    if (logFileReady) {
+    if (logFileReady && ENABLE_WIFI_SCAN) {
       consolePrintf("\n[WiFi Task] Starting WiFi scan at %lu ms\n", millis());
       wifiScanning = true;
       scanWiFi();
@@ -428,7 +404,7 @@ void wifiScanTask(void* parameter) {
 void bleScanTask(void* parameter) {
   vTaskDelay(pdMS_TO_TICKS(3500));  // Start after WiFi finishes (~3s scan + 0.5s buffer)
   while (true) {
-    if (logFileReady) {
+    if (logFileReady && ENABLE_BLE_SCAN) {
       consolePrintf("\n[BLE Task] Starting BLE scan at %lu ms\n", millis());
       bleScanning = true;
       scanBluetooth();
@@ -558,9 +534,18 @@ void setup() {
   }
   consolePrintln("FreeRTOS mutexes and queue created successfully");
 
-  // Initialize BOOT button for light sleep
-  pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);  // BOOT button (active LOW)
-  consolePrintln("BOOT button initialized for light sleep (GPIO28)");
+  // Initialize multi-function button for file sharing and deep sleep
+  pinMode(SHARE_BUTTON_PIN, INPUT_PULLUP);  // Active LOW with internal pullup
+  consolePrintln("Share button initialized (GPIO7): 1s = file share, 3s = sleep");
+
+  // If waking from deep sleep, wait for button release to avoid immediate re-trigger
+  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_GPIO) {
+    consolePrintln("Woke from deep sleep - waiting for button release...");
+    while (digitalRead(SHARE_BUTTON_PIN) == LOW) {
+      delay(50);
+    }
+    consolePrintln("Button released, continuing boot");
+  }
 
   // ============================================
   // CRITICAL: Initialize SD card FIRST before any radio initialization
@@ -648,6 +633,7 @@ void setup() {
       consolePrintln("ERROR: SSD1306 allocation failed!");
       consolePrintln("Continuing without display...");
     } else {
+      display.setRotation(2);  // Rotate display 180 degrees
       display.clearDisplay();
       display.setTextSize(1);
       display.setTextColor(SSD1306_WHITE);
@@ -667,20 +653,28 @@ void setup() {
 
   // Initialize WiFi
   consolePrintln("\n[6/7] Initializing WiFi...");
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect();
-  delay(100);
-  consolePrintln("WiFi initialized (dual-band 2.4GHz + 5GHz mode)");
+  if (ENABLE_WIFI_SCAN) {
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+    delay(100);
+    consolePrintln("WiFi initialized (dual-band 2.4GHz + 5GHz mode)");
+  } else {
+    consolePrintln("WiFi scanning disabled in config");
+  }
 
   // Initialize BLE
   consolePrintln("Initializing BLE...");
-  BLEDevice::init("SignalScout");
-  pBLEScan = BLEDevice::getScan();
-  pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
-  pBLEScan->setActiveScan(true);
-  pBLEScan->setInterval(100);
-  pBLEScan->setWindow(99);
-  consolePrintln("BLE initialized");
+  if (ENABLE_BLE_SCAN) {
+    BLEDevice::init("SignalScout");
+    pBLEScan = BLEDevice::getScan();
+    pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
+    pBLEScan->setActiveScan(true);
+    pBLEScan->setInterval(100);
+    pBLEScan->setWindow(99);
+    consolePrintln("BLE initialized");
+  } else {
+    consolePrintln("BLE scanning disabled in config");
+  }
 
   // Initialize Zigbee LAST (IEEE 802.15.4)
   // This must be after SD card to prevent SPI conflicts
@@ -820,38 +814,46 @@ void setup() {
   }
 
   // WiFi Scan Task
-  BaseType_t result = xTaskCreate(
-    wifiScanTask,        // Task function
-    "WiFi Scanner",      // Task name
-    4096,                // Stack size (reduced from 8192)
-    NULL,                // Parameters
-    1,                   // Priority
-    &wifiScanTaskHandle  // Task handle
-  );
-  if (result != pdPASS) {
-    consolePrintln("ERROR: Failed to create WiFi Scanner task!");
+  if (ENABLE_WIFI_SCAN) {
+    BaseType_t result = xTaskCreate(
+      wifiScanTask,        // Task function
+      "WiFi Scanner",      // Task name
+      4096,                // Stack size (reduced from 8192)
+      NULL,                // Parameters
+      1,                   // Priority
+      &wifiScanTaskHandle  // Task handle
+    );
+    if (result != pdPASS) {
+      consolePrintln("ERROR: Failed to create WiFi Scanner task!");
+    } else {
+      consolePrintln("WiFi Scanner task created");
+    }
   } else {
-    consolePrintln("WiFi Scanner task created");
+    consolePrintln("WiFi Scanner task skipped (WiFi scanning disabled)");
   }
 
   // BLE Scan Task
-  result = xTaskCreate(
-    bleScanTask,         // Task function
-    "BLE Scanner",       // Task name
-    4096,                // Stack size (reduced from 8192)
-    NULL,                // Parameters
-    1,                   // Priority
-    &bleScanTaskHandle   // Task handle
-  );
-  if (result != pdPASS) {
-    consolePrintln("ERROR: Failed to create BLE Scanner task!");
+  if (ENABLE_BLE_SCAN) {
+    BaseType_t result = xTaskCreate(
+      bleScanTask,         // Task function
+      "BLE Scanner",       // Task name
+      4096,                // Stack size (reduced from 8192)
+      NULL,                // Parameters
+      1,                   // Priority
+      &bleScanTaskHandle   // Task handle
+    );
+    if (result != pdPASS) {
+      consolePrintln("ERROR: Failed to create BLE Scanner task!");
+    } else {
+      consolePrintln("BLE Scanner task created");
+    }
   } else {
-    consolePrintln("BLE Scanner task created");
+    consolePrintln("BLE Scanner task skipped (BLE scanning disabled)");
   }
 
   // Zigbee Scan Task
   if (ENABLE_ZIGBEE_SCAN && zigbeeInitialized) {
-    result = xTaskCreate(
+    BaseType_t result = xTaskCreate(
       zigbeeScanTask,        // Task function
       "Zigbee Scanner",      // Task name
       4096,                  // Stack size (reduced from 8192)
@@ -879,11 +881,10 @@ void setup() {
   setLEDOff();
   consolePrintln("Status LED turned off to conserve battery");
 
-  // Configure light sleep wakeup source (GPIO wakeup - BOOT button)
-  // Wake when GPIO28 goes LOW (button pressed)
-  gpio_wakeup_enable((gpio_num_t)BOOT_BUTTON_PIN, GPIO_INTR_LOW_LEVEL);
+  // Configure deep sleep wakeup source (GPIO wakeup - share button)
+  gpio_wakeup_enable((gpio_num_t)SHARE_BUTTON_PIN, GPIO_INTR_LOW_LEVEL);
   esp_sleep_enable_gpio_wakeup();
-  consolePrintln("Light sleep wakeup configured (hold BOOT button for 1 second to wake)");
+  consolePrintln("Deep sleep wakeup configured (press button to wake)");
 
   consolePrintln("\nEntering main loop (GPS monitoring, battery checks, and display updates)...\n");
 }
@@ -934,30 +935,43 @@ void loop() {
 
   // Update display periodically - GUARANTEED to run every second
   if (ENABLE_DISPLAY_OUTPUT && currentTime - lastDisplayUpdate >= DISPLAY_UPDATE_INTERVAL) {
-    updateDisplay("");
+    if (fileSharingMode) {
+      updateDisplayFileSharing();
+    } else {
+      updateDisplay("");
+    }
     lastDisplayUpdate = currentTime;
   }
 
-  // Check for light sleep button press (BOOT button on GPIO28)
-  // Button is active LOW (pressed = LOW, released = HIGH)
-  bool currentButtonState = (digitalRead(BOOT_BUTTON_PIN) == LOW);
+  // Multi-function button (SHARE_BUTTON_PIN on GPIO7)
+  // Hold and release between 1-3s: toggle file sharing mode
+  // Hold 3s (while still held): enter deep sleep
+  bool shareButtonState = (digitalRead(SHARE_BUTTON_PIN) == LOW);
 
-  if (currentButtonState && !buttonPressed) {
+  if (shareButtonState && !buttonPressed) {
     // Button just pressed, start timing
     buttonPressed = true;
     buttonPressStart = currentTime;
-  } else if (currentButtonState && buttonPressed) {
-    // Button is being held, check if held long enough for sleep
+  } else if (shareButtonState && buttonPressed) {
+    // Button is being held, check for 3-second sleep threshold
     unsigned long holdDuration = currentTime - buttonPressStart;
     if (holdDuration >= SLEEP_HOLD_TIME) {
-      // Enter light sleep
-      enterLightSleep();
-      // Note: After waking from light sleep, execution continues here
-      // Reset button state after wake
-      buttonPressed = false;
+      if (fileSharingMode) {
+        exitFileSharingMode();
+      }
+      enterDeepSleep();
+      // enterDeepSleep() does not return - device reboots on wake
     }
-  } else if (!currentButtonState && buttonPressed) {
-    // Button released
+  } else if (!shareButtonState && buttonPressed) {
+    // Button released - check if held long enough for file share toggle
+    unsigned long holdDuration = currentTime - buttonPressStart;
+    if (holdDuration >= SHARE_HOLD_TIME) {
+      if (!fileSharingMode) {
+        enterFileSharingMode();
+      } else {
+        exitFileSharingMode();
+      }
+    }
     buttonPressed = false;
   }
 
@@ -965,9 +979,9 @@ void loop() {
   delay(10);
 }
 
-void enterLightSleep() {
-  consolePrintln("\n=== ENTERING LIGHT SLEEP ===");
-  consolePrintln("Hold BOOT button for 1 second to wake up");
+void enterDeepSleep() {
+  consolePrintln("\n=== ENTERING DEEP SLEEP ===");
+  consolePrintln("Press button to wake up (device will reboot)");
 
   // Show "Going to sleep" message on display
   if (ENABLE_DISPLAY_OUTPUT) {
@@ -985,9 +999,9 @@ void enterLightSleep() {
     display.display();
   }
 
-  // Log to SD card
+  // Log to SD card before sleep (flush queue first)
   if (ENABLE_LOG_OUTPUT && logFileReady) {
-    logToFile("Entering light sleep mode");
+    logToFile("Entering deep sleep mode");
   }
 
   // Turn off status LED
@@ -996,31 +1010,201 @@ void enterLightSleep() {
   // Flush serial output
   Serial.flush();
 
-  // Enter light sleep (wake on BOOT button press - GPIO wakeup already configured in setup)
-  esp_light_sleep_start();
+  // Enter deep sleep (wakes on button press - GPIO wakeup configured in setup)
+  // esp_deep_sleep_start() does not return - device reboots when woken
+  esp_deep_sleep_start();
+}
 
-  // Execution continues here after waking from light sleep
-  consolePrintln("\n=== WAKING FROM LIGHT SLEEP ===");
+// Format file size for display in file browser
+String formatFileSize(size_t size) {
+  if (size < 1024) return String(size) + " B";
+  if (size < 1024 * 1024) return String((float)size / 1024.0, 1) + " KB";
+  return String((float)size / (1024.0 * 1024.0), 1) + " MB";
+}
 
-  // Log wake event
-  if (ENABLE_LOG_OUTPUT && logFileReady) {
-    logToFile("Waking from light sleep mode");
-  }
+// Configure web server routes (called once before first server.begin())
+void configureServerRoutes() {
+  if (serverRoutesConfigured) return;
 
-  // Re-enable LED briefly to show wake
-  setLEDColor(0, 255, 0);  // Green
-  delay(500);
-  setLEDOff();
+  // Root page - lists all files on SD card with download links
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
+    String html = "<!DOCTYPE html><html><head><title>SignalScout Files</title>"
+                  "<style>"
+                  "body{font-family:sans-serif;margin:20px;background:#1a1a2e;color:#e0e0e0;}"
+                  "h1{color:#00d4ff;margin-bottom:20px;}"
+                  "a{color:#00d4ff;text-decoration:none;}"
+                  "a:hover{text-decoration:underline;}"
+                  ".file{padding:8px 0;border-bottom:1px solid #333;"
+                  "display:flex;justify-content:space-between;}"
+                  ".size{color:#888;font-size:0.85em;}"
+                  ".empty{color:#666;font-style:italic;}"
+                  "</style></head><body>"
+                  "<h1>SignalScout File Browser</h1>";
 
-  // Update display
+    bool hasFiles = false;
+    File root = SD.open("/");
+    if (root) {
+      File file = root.openNextFile();
+      while (file) {
+        if (!file.isDirectory()) {
+          hasFiles = true;
+          String name = file.name();
+          size_t sz = file.size();
+          html += "<div class=\"file\">"
+                  "<a href=\"/download?name=" + name + "\">" + name + "</a>"
+                  "<span class=\"size\">" + formatFileSize(sz) + "</span>"
+                  "</div>";
+        }
+        file.close();
+        file = root.openNextFile();
+      }
+      root.close();
+    }
+
+    if (!hasFiles) {
+      html += "<p class=\"empty\">No files found on SD card.</p>";
+    }
+
+    html += "</body></html>";
+    request->send(200, "text/html", html);
+  });
+
+  // File download - streams file directly from SD card
+  server.on("/download", HTTP_GET, [](AsyncWebServerRequest* request) {
+    if (!request->hasParam("name")) {
+      request->send(400, "text/plain", "Missing filename");
+      return;
+    }
+    String filename = request->getParam("name")->value();
+    // Block path traversal attempts
+    if (filename.indexOf("..") >= 0) {
+      request->send(400, "text/plain", "Invalid filename");
+      return;
+    }
+    String filepath = "/" + filename;
+    if (SD.exists(filepath.c_str())) {
+      request->send(SD, filepath, "application/octet-stream", true);
+    } else {
+      request->send(404, "text/plain", "File not found");
+    }
+  });
+
+  serverRoutesConfigured = true;
+}
+
+void enterFileSharingMode() {
+  consolePrintln("\n=== ENTERING FILE SHARING MODE ===");
+  fileSharingMode = true;
+
+  // Suspend all scanning and logging tasks to avoid SD and radio conflicts
+  if (wifiScanTaskHandle) vTaskSuspend(wifiScanTaskHandle);
+  if (bleScanTaskHandle) vTaskSuspend(bleScanTaskHandle);
+  if (zigbeeScanTaskHandle) vTaskSuspend(zigbeeScanTaskHandle);
+  if (sdLogTaskHandle) vTaskSuspend(sdLogTaskHandle);
+
+  // Connect to WiFi using credentials from secrets.h
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  consolePrintf("Connecting to WiFi: %s\n", WIFI_SSID);
+
   if (ENABLE_DISPLAY_OUTPUT) {
     display.clearDisplay();
-    display.setTextSize(2);
-    display.setCursor(20, 20);
-    display.println("Awake!");
+    display.setTextSize(1);
+    display.setCursor(2, 0);
+    display.println("File Share Mode");
+    display.setCursor(2, 16);
+    display.println("Connecting...");
     display.display();
-    delay(1000);
   }
+
+  // Wait for connection with 10-second timeout
+  unsigned long wifiTimeout = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wifiTimeout < 10000) {
+    delay(250);
+    consolePrint(".");
+  }
+  consolePrintln("");
+
+  if (WiFi.status() != WL_CONNECTED) {
+    consolePrintln("ERROR: Failed to connect to WiFi!");
+    consolePrintln("Check SSID and password in secrets.h");
+    fileSharingMode = false;
+
+    // Resume tasks on failure
+    if (wifiScanTaskHandle) vTaskResume(wifiScanTaskHandle);
+    if (bleScanTaskHandle) vTaskResume(bleScanTaskHandle);
+    if (zigbeeScanTaskHandle) vTaskResume(zigbeeScanTaskHandle);
+    if (sdLogTaskHandle) vTaskResume(sdLogTaskHandle);
+
+    if (ENABLE_DISPLAY_OUTPUT) {
+      display.clearDisplay();
+      display.setTextSize(1);
+      display.setCursor(2, 0);
+      display.println("WiFi Connect");
+      display.setCursor(2, 16);
+      display.println("FAILED - check");
+      display.setCursor(2, 32);
+      display.println("secrets.h");
+      display.display();
+    }
+    delay(3000);
+    return;
+  }
+
+  fileSharingIP = WiFi.localIP().toString();
+  consolePrintf("Connected! IP: %s\n", fileSharingIP.c_str());
+
+  // Configure routes (first time only) and start server
+  configureServerRoutes();
+  server.begin();
+  consolePrintln("File server started on port 80");
+
+  // Update LED and log
+  ledFileSharing();
+  if (ENABLE_LOG_OUTPUT && logFileReady) {
+    logToFile("Entered file sharing mode - IP: " + fileSharingIP);
+  }
+  consolePrintln((String("Open http://") + fileSharingIP + " in a browser to browse files").c_str());
+}
+
+void exitFileSharingMode() {
+  consolePrintln("\n=== EXITING FILE SHARING MODE ===");
+
+  if (ENABLE_LOG_OUTPUT && logFileReady) {
+    logToFile("Exiting file sharing mode");
+  }
+
+  // Stop web server and disconnect WiFi
+  server.end();
+  WiFi.disconnect();
+  delay(500);
+
+  fileSharingMode = false;
+
+  // Resume all scanning and logging tasks
+  if (wifiScanTaskHandle) vTaskResume(wifiScanTaskHandle);
+  if (bleScanTaskHandle) vTaskResume(bleScanTaskHandle);
+  if (zigbeeScanTaskHandle) vTaskResume(zigbeeScanTaskHandle);
+  if (sdLogTaskHandle) vTaskResume(sdLogTaskHandle);
+
+  setLEDOff();
+  consolePrintln("File sharing mode exited, scanning resumed");
+}
+
+void updateDisplayFileSharing() {
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setCursor(2, 0);
+  display.println("FILE SHARE");
+  display.setTextSize(1);
+  display.setCursor(2, 22);
+  display.print("IP: ");
+  display.println(fileSharingIP);
+  display.setCursor(2, 38);
+  display.println("Hold 1s: exit");
+  display.setCursor(2, 50);
+  display.println("Hold 3s: sleep");
+  display.display();
 }
 
 // Helper function to convert auth mode to string

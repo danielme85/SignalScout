@@ -20,6 +20,8 @@ SignalScout is a wardriving and wireless reconnaissance tool that scans 2.4GHz a
 - 🔒 Encryption type detection
 - 🔋 Battery level monitoring with on-screen indicator
 - 💡 RGB LED status indicator during boot sequence
+- 📁 SD card file sharing over WiFi (browse and download log files from a browser)
+- 😴 Light sleep mode for battery conservation (button-controlled)
 
 ## Hardware Required
 
@@ -31,6 +33,7 @@ SignalScout is a wardriving and wireless reconnaissance tool that scans 2.4GHz a
 | **SD Card Module** | Micro SD SPI adapter | SPI (MOSI:3, MISO:1, CLK:0, CS:2) |
 | **RGB LED** | WS2812B | Data: GPIO27 |
 | **Battery** | 3.7V LiPo 3000mAh | Via charging port + voltage divider to GPIO6 |
+| **Push Button** | Momentary tactile switch | GPIO7 (active LOW, internal pullup) |
 
 > **Note:** MOSI and CLK pins can be shared between SD card and OLED display since both use SPI, but each needs a unique CS (Chip Select) pin.
 
@@ -98,6 +101,8 @@ Go to Tools → Manage Libraries and install:
 - `Adafruit SSD1306`
 - `Adafruit NeoPixel`
 - `ESP32Time`
+- `ESPAsyncWebServer`
+- `AsyncTCP`
 
 ### 2. Hardware Assembly
 
@@ -133,7 +138,12 @@ Go to Tools → Manage Libraries and install:
    - Battery (+) → 200kΩ resistor → GPIO6 → 100kΩ resistor → GND
    - See voltage divider diagram above for proper ratio
 
-6. **Insert a formatted SD card** (FAT32 recommended)
+6. **Connect Push Button:**
+   - One terminal → GPIO7
+   - Other terminal → GND
+   - No external pullup resistor needed (internal pullup is enabled in firmware)
+
+7. **Insert a formatted SD card** (FAT32 recommended)
 
 ### 3. Upload Code
 
@@ -154,6 +164,7 @@ Go to Tools → Manage Libraries and install:
    - 🟠 **Orange** = Waiting for GPS signal
    - 🟢 **Green** = Ready, about to start scanning
    - ⚫ **Off** = Scanning active (LED off to save battery)
+   - 🔵 **Blue** = File sharing mode active
 3. **Wait for GPS lock** - display shows "Waiting GPS" with satellite count and elapsed time (30-60 seconds)
 4. **Scans run automatically** after GPS lock, every 10 seconds in staggered sequence:
    - WiFi scans for ~3 seconds (asterisk appears: `W:12(47)*`)
@@ -162,6 +173,46 @@ Go to Tools → Manage Libraries and install:
 5. **Display updates every second** with GPS time, battery, and device counts
 6. **Start moving** to see compass direction and speed (requires >1 km/h movement)
 7. **Data is logged** to `/scan_YYYYMMDD_HHMMSS.txt` on the SD card after each scan completes
+
+### Button Controls (GPIO7)
+
+The push button on GPIO7 is a multi-function control. Hold duration determines the action:
+
+| Action | How |
+|--------|-----|
+| **Toggle file sharing** | Press and hold for 1 second, then **release** (before 3s) |
+| **Enter light sleep** | Press and hold for 3 seconds (no release needed) |
+| **Wake from sleep** | Hold button for 1 second while device is sleeping |
+
+> Releasing the button before 1 second does nothing. If you hold past 3 seconds the device enters sleep regardless — it will exit file sharing mode first if that was active.
+
+## File Sharing Mode
+
+File sharing mode gives you wireless access to all log files on the SD card without removing it from the device.
+
+### How It Works
+
+1. **Enter:** Hold the button for 1 second and release. All scanning tasks pause.
+2. The device connects to your WiFi network using credentials from `secrets.h` (10-second timeout).
+3. The OLED displays the assigned IP address and the LED turns **blue**.
+4. Open `http://<IP>` in any browser on the same network — you'll see a file listing page with clickable download links for every file on the SD card root.
+5. **Exit:** Hold the button for 1 second and release again. The web server stops, WiFi disconnects, and scanning resumes automatically.
+
+### Setting Up `secrets.h`
+
+Before uploading, create a `secrets.h` file in the same directory as `SignalScout.ino` and fill in your network credentials:
+
+```cpp
+#ifndef SECRETS_H
+#define SECRETS_H
+
+const char* WIFI_SSID     = "YourNetworkSSID";
+const char* WIFI_PASSWORD = "YourNetworkPassword";
+
+#endif
+```
+
+> This file is listed in `.gitignore` so your credentials won't be committed to version control.
 
 ## Log File Format
 
@@ -242,7 +293,7 @@ ZIGBEE,8A3F5C12,2026-01-24 22:57:28,41.342818,-81.389299,328.10,8,1.34,0x1A2B,00
 
 ## Configuration
 
-Key settings can be adjusted at the top of `SignalScout.ino`:
+WiFi credentials for file sharing are stored separately in `secrets.h` (see [File Sharing Mode](#file-sharing-mode) above). All other key settings can be adjusted at the top of `SignalScout.ino`:
 
 ```cpp
 // Output control
@@ -283,6 +334,10 @@ In Arduino IDE, configure Zigbee via Tools menu:
 | **Zigbee init failed** | Check Arduino IDE: Zigbee Mode and Partition Scheme must be configured |
 | **No Zigbee networks found** | Normal if no Zigbee/Thread devices nearby; they're less common than WiFi |
 | **Z:0(0) always** | Ensure `ENABLE_ZIGBEE_SCAN true` and correct IDE settings |
+| **File sharing WiFi fails** | Verify SSID and password in `secrets.h`, ensure device is within range of your network |
+| **File sharing not starting** | Check button wiring (GPIO7 to GND), hold for a full second before releasing |
+| **No files listed in browser** | SD card must be mounted and contain files in the root directory |
+| **Device won't wake from sleep** | Hold the button for a full second; ensure GPIO7 wiring is secure |
 
 ## Data Analysis
 
