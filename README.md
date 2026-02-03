@@ -2,17 +2,16 @@
 
 # SignalScout 📡
 
-**A portable WiFi, Bluetooth, and Zigbee scanner with GPS tracking for ESP32-C5**
+**A portable WiFi and Bluetooth scanner with GPS tracking for ESP32-C5**
 
 ![Logo](./Untitled.jpeg)
 
-SignalScout is a wardriving and wireless reconnaissance tool that scans 2.4GHz and 5GHz WiFi networks, Bluetooth Low Energy (BLE) devices, and Zigbee networks (IEEE 802.15.4), logging everything to an SD card with precise GPS coordinates and timestamps.
+SignalScout is a wardriving and wireless reconnaissance tool that scans 2.4GHz and 5GHz WiFi networks and Bluetooth Low Energy (BLE) devices, logging everything to an SD card with precise GPS coordinates and timestamps.
 
 ## Features
 
 - 📶 Dual-band WiFi scanning (2.4GHz & 5GHz)
 - 🔵 Bluetooth Low Energy (BLE) device discovery
-- 🟢 Zigbee network scanning (IEEE 802.15.4, channels 11-26)
 - 📍 GPS-tagged logging with location, altitude, and satellite data
 - 📊 Real-time OLED display with stats and countdown
 - 💾 CSV logging to SD card for mapping and analysis
@@ -21,7 +20,7 @@ SignalScout is a wardriving and wireless reconnaissance tool that scans 2.4GHz a
 - 🔋 Battery level monitoring with on-screen indicator
 - 💡 RGB LED status indicator during boot sequence
 - 📁 SD card file sharing over WiFi (browse and download log files from a browser)
-- 😴 Light sleep mode for battery conservation (button-controlled)
+- 😴 Deep sleep mode for battery conservation (button-controlled)
 
 ## Hardware Required
 
@@ -33,7 +32,7 @@ SignalScout is a wardriving and wireless reconnaissance tool that scans 2.4GHz a
 | **SD Card Module** | Micro SD SPI adapter | SPI (MOSI:3, MISO:1, CLK:0, CS:2) |
 | **RGB LED** | WS2812B | Data: GPIO27 |
 | **Battery** | 3.7V LiPo 3000mAh | Via charging port + voltage divider to GPIO6 |
-| **Push Button** | Momentary tactile switch | GPIO7 (active LOW, internal pullup) |
+| **Push Button** | Momentary tactile switch | GPIO23 (active LOW, internal pullup) |
 
 > **Note:** MOSI and CLK pins can be shared between SD card and OLED display since both use SPI, but each needs a unique CS (Chip Select) pin.
 
@@ -55,13 +54,12 @@ The OLED display provides real-time visual feedback, updating every 1 second:
 
 ```
 ┌──────────────────────────────────────────────┐
-│ 📡▂▄▆█     [██░░]85%        065° NE         │  ← GPS satellites | Battery | Compass
+│ 📡▂▄▆█     [██░░]85%        NE              │  ← GPS satellites | Battery | Compass
 ├──────────────────────────────────────────────┤
-│ W:12(47)*              Scan in: 5s           │  ← WiFi: last(total)*
+│ W:12(47)*              (WiFi logo)           │  ← WiFi: last(total)*
 │ B:8(23)                                      │  ← BLE: last(total)
-│ Z:2(5)                                       │  ← Zigbee: last(total)
 ├──────────────────────────────────────────────┤
-│ 14:23:57                       45M 72K       │  ← GPS time (UTC) | Speed (MPH/KPH)
+│ 14:23:57                       45MPH 72KPH   │  ← GPS time (UTC) | Speed (MPH/KPH)
 └──────────────────────────────────────────────┘
 ```
 
@@ -69,15 +67,15 @@ The OLED display provides real-time visual feedback, updating every 1 second:
 
 - **Top Left:** Satellite icon with signal strength bars (0-5 bars based on satellite count)
 - **Top Center:** Battery indicator with icon and percentage (updates every 5 seconds)
-- **Top Right:** Degree heading (000-359°) and compass direction (N, NE, E, SE, S, SW, W, NW)
+- **Top Right:** Compass direction (N, NE, E, SE, S, SW, W, NW)
   - Requires movement >1 km/h to display compass bearing
-- **Center Left:** Device counters showing format "W:X(XX)", "B:X(XX)", "Z:X(XX)"
-  - First number = devices/networks found in last scan
-  - Number in parentheses = total unique devices/networks seen since boot
+- **Center Left:** Device counters showing format "W:X(XX)", "B:X(XX)"
+  - First number = devices found in last scan
+  - Number in parentheses = total unique devices seen since boot
   - **Asterisk (*)** appears when actively scanning (e.g., "W:5(23)*" during WiFi scan)
-- **Center Right:** Countdown timer "Scan in: Xs" showing seconds until next scan cycle
+- **Center Right:** Animated WiFi logo
 - **Bottom Left:** Current UTC time from GPS in HH:MM:SS format (2px left margin, updates every second)
-- **Bottom Right:** Current speed in MPH and KPH format "XXM YYK" (2px right margin, right-aligned)
+- **Bottom Right:** Current speed in MPH and KPH format (2px right margin, right-aligned)
 
 ## Quick Start Guide
 
@@ -139,7 +137,7 @@ Go to Tools → Manage Libraries and install:
    - See voltage divider diagram above for proper ratio
 
 6. **Connect Push Button:**
-   - One terminal → GPIO7
+   - One terminal → GPIO23
    - Other terminal → GND
    - No external pullup resistor needed (internal pullup is enabled in firmware)
 
@@ -150,11 +148,8 @@ Go to Tools → Manage Libraries and install:
 1. Open `SignalScout.ino` in Arduino IDE
 2. Select board: Tools → Board → ESP32 → ESP32-C5
 3. Select the correct COM port: Tools → Port
-4. **Configure Zigbee settings:**
-   - Tools → Zigbee Mode → **Zigbee ED (End Device)** (recommended for scanning)
-   - Tools → Partition Scheme → **Zigbee 4MB with spiffs** (or appropriate for your flash size)
-5. Click Upload
-6. Open Serial Monitor (115200 baud) to see scan output
+4. Click Upload
+5. Open Serial Monitor (115200 baud) to see scan output
 
 ### 4. Field Operation
 
@@ -166,23 +161,22 @@ Go to Tools → Manage Libraries and install:
    - ⚫ **Off** = Scanning active (LED off to save battery)
    - 🔵 **Blue** = File sharing mode active
 3. **Wait for GPS lock** - display shows "Waiting GPS" with satellite count and elapsed time (30-60 seconds)
-4. **Scans run automatically** after GPS lock, every 10 seconds in staggered sequence:
+4. **Scans run automatically** after GPS lock, every 10 seconds:
    - WiFi scans for ~3 seconds (asterisk appears: `W:12(47)*`)
-   - BLE scans for ~3 seconds starting at +3.5s (asterisk appears: `B:8(23)*`)
-   - Zigbee scans for ~3 seconds starting at +7s (asterisk appears: `Z:2(5)*`)
+   - BLE scans for ~3 seconds after WiFi completes (asterisk appears: `B:8(23)*`)
 5. **Display updates every second** with GPS time, battery, and device counts
 6. **Start moving** to see compass direction and speed (requires >1 km/h movement)
 7. **Data is logged** to `/scan_YYYYMMDD_HHMMSS.txt` on the SD card after each scan completes
 
-### Button Controls (GPIO7)
+### Button Controls (GPIO23)
 
-The push button on GPIO7 is a multi-function control. Hold duration determines the action:
+The push button on GPIO23 is a multi-function control. Hold duration determines the action:
 
 | Action | How |
 |--------|-----|
 | **Toggle file sharing** | Press and hold for 1 second, then **release** (before 3s) |
-| **Enter light sleep** | Press and hold for 3 seconds (no release needed) |
-| **Wake from sleep** | Hold button for 1 second while device is sleeping |
+| **Enter deep sleep** | Press and hold for 3 seconds (no release needed) |
+| **Wake from sleep** | Press the button while device is sleeping (triggers reboot) |
 
 > Releasing the button before 1 second does nothing. If you hold past 3 seconds the device enters sleep regardless — it will exit file sharing mode first if that was active.
 
@@ -216,7 +210,7 @@ const char* WIFI_PASSWORD = "YourNetworkPassword";
 
 ## Log File Format
 
-Each log file begins with a comprehensive header documenting all column formats and field descriptions. Each device/network is then logged on one line with complete GPS data in CSV format.
+Each log file begins with a comprehensive header documenting all column formats and field descriptions. Each device is then logged on one line with complete GPS data in CSV format.
 
 ### Column Headers
 
@@ -230,15 +224,10 @@ Type,Fingerprint,Timestamp,Latitude,Longitude,Altitude,Satellites,HDOP,SSID,BSSI
 Type,Fingerprint,Timestamp,Latitude,Longitude,Altitude,Satellites,HDOP,Name,Address,RSSI,ManufacturerData,ServiceUUID
 ```
 
-**Zigbee Format:**
-```
-Type,Fingerprint,Timestamp,Latitude,Longitude,Altitude,Satellites,HDOP,PAN_ID,ExtendedPAN_ID,Channel,PermitJoin,RouterCapacity,EndDeviceCapacity
-```
-
 ### Field Descriptions
 
 **Common Fields:**
-- **Fingerprint**: 8-character hex ID derived from device MAC/PAN ID (stable, unique identifier)
+- **Fingerprint**: 8-character hex ID derived from device MAC address (stable, unique identifier)
 - **Timestamp**: UTC time from GPS (`YYYY-MM-DD HH:MM:SS`) or RTC with `(RTC)` suffix
 - **Latitude/Longitude**: GPS coordinates in decimal degrees
 - **Altitude**: Elevation in meters above sea level
@@ -260,14 +249,6 @@ Type,Fingerprint,Timestamp,Latitude,Longitude,Altitude,Satellites,HDOP,PAN_ID,Ex
 - **ManufacturerData**: Hex-encoded manufacturer data (if present)
 - **ServiceUUID**: Advertised service UUID (if present)
 
-**Zigbee Fields:**
-- **PAN_ID**: 16-bit network ID (e.g., `0x1A2B`)
-- **ExtendedPAN_ID**: 64-bit unique network ID (e.g., `00:11:22:33:44:55:66:77`)
-- **Channel**: Zigbee channel 11-26 (all 2.4GHz)
-- **PermitJoin**: Network accepting joins (`Yes`/`No`)
-- **RouterCapacity**: Can accept routers (`Yes`/`No`)
-- **EndDeviceCapacity**: Can accept end devices (`Yes`/`No`)
-
 ### Example Entries
 
 **WiFi (Home router):**
@@ -278,11 +259,6 @@ WIFI,3C7B6E95,2026-01-24 22:57:04,41.342822,-81.389317,327.20,8,1.34,MyHomeNetwo
 **BLE (Smart watch):**
 ```
 BLE,FA2FAF58,2026-01-24 22:57:16,41.342820,-81.389308,327.90,8,1.34,Smart Watch,58:D9:FA:AF:2F:FD,-65,4C001005,0000180A
-```
-
-**Zigbee (Smart home hub):**
-```
-ZIGBEE,8A3F5C12,2026-01-24 22:57:28,41.342818,-81.389299,328.10,8,1.34,0x1A2B,00:11:22:33:44:55:66:77,15,Yes,Yes,No
 ```
 
 **Notes:**
@@ -297,27 +273,19 @@ WiFi credentials for file sharing are stored separately in `secrets.h` (see [Fil
 
 ```cpp
 // Output control
-#define ENABLE_CONSOLE_OUTPUT true   // Serial console output
+#define ENABLE_CONSOLE_OUTPUT false  // Serial console output
 #define ENABLE_DISPLAY_OUTPUT true   // OLED display
 #define ENABLE_LOG_OUTPUT true       // SD card logging
-#define ENABLE_ZIGBEE_SCAN true      // Zigbee network scanning
 
-// Timing (staggered scanning for smooth display updates)
+// Timing
 #define SCAN_INTERVAL 10           // Scan cycle repeats every 10 seconds
 #define BLE_SCAN_TIME 3            // BLE scan duration: 3 seconds
-#define ZIGBEE_SCAN_DURATION 5     // Zigbee scan duration: ~3 seconds
 // WiFi scans for ~3 seconds
-// Scans run sequentially: WiFi (0s) → BLE (3.5s) → Zigbee (7s) → repeat
+// Scans run sequentially: WiFi → BLE → repeat
 
 // Battery voltage divider
 #define VOLTAGE_DIVIDER_RATIO 3.333333  // For 200k/100k divider
 ```
-
-### Zigbee Mode Selection
-
-In Arduino IDE, configure Zigbee via Tools menu:
-- **Zigbee ED (End Device)**: Recommended for scanning - passive, low power
-- **Zigbee ZCZR (Coordinator/Router)**: Alternative - can also route traffic
 
 ## Troubleshooting
 
@@ -331,13 +299,10 @@ In Arduino IDE, configure Zigbee via Tools menu:
 | **LED stays red** | Initialization stuck, check serial monitor for errors |
 | **LED stays orange** | GPS not getting signal, move to open sky area |
 | **Battery shows 0% or wrong** | Check voltage divider wiring, adjust `VOLTAGE_DIVIDER_RATIO` in code |
-| **Zigbee init failed** | Check Arduino IDE: Zigbee Mode and Partition Scheme must be configured |
-| **No Zigbee networks found** | Normal if no Zigbee/Thread devices nearby; they're less common than WiFi |
-| **Z:0(0) always** | Ensure `ENABLE_ZIGBEE_SCAN true` and correct IDE settings |
 | **File sharing WiFi fails** | Verify SSID and password in `secrets.h`, ensure device is within range of your network |
-| **File sharing not starting** | Check button wiring (GPIO7 to GND), hold for a full second before releasing |
+| **File sharing not starting** | Check button wiring (GPIO23 to GND), hold for a full second before releasing |
 | **No files listed in browser** | SD card must be mounted and contain files in the root directory |
-| **Device won't wake from sleep** | Hold the button for a full second; ensure GPIO7 wiring is secure |
+| **Device won't wake from sleep** | Press the button; ensure GPIO23 wiring is secure |
 
 ## Data Analysis
 

@@ -1,6 +1,6 @@
 /*
- * SignalScout - WiFi, Bluetooth, and Zigbee Scanner for ESP32-C5
- * Scans 2.4GHz and 5GHz WiFi networks, Bluetooth LE devices, and Zigbee networks
+ * SignalScout - WiFi and Bluetooth Scanner for ESP32-C5
+ * Scans 2.4GHz and 5GHz WiFi networks and Bluetooth LE devices
  * Logs all activity to SD card over SPI with GPS timestamps and location
  * Displays status on SSD1309 OLED display
  *
@@ -10,10 +10,6 @@
  * OLED: SSD1309 128x64 connected via SPI
  * RGB LED: WS2812B on GPIO27 for status indication
  * Battery: 3.7V LiPo with voltage divider on GPIO6
- *
- * Zigbee Note: Requires Arduino IDE settings:
- *   Tools -> Zigbee Mode -> Zigbee ED (End Device) [recommended for scanning]
- *   Tools -> Partition Scheme -> Zigbee with spiffs (size appropriate for your flash)
  */
 
 #include <WiFi.h>
@@ -30,7 +26,6 @@
 #include <Adafruit_SSD1306.h>
 #include <ESP32Time.h>
 #include <Adafruit_NeoPixel.h>
-#include <Zigbee.h>
 #include <stdarg.h>
 #include "secrets.h"
 // File sharing via WiFi (install ESPAsyncWebServer and AsyncTCP libraries)
@@ -61,7 +56,7 @@
 #define LED_COUNT    1       // Number of LEDs
 
 // Multi-function Button Pin (File Share / Deep Sleep)
-#define SHARE_BUTTON_PIN  7     // GPIO for file share / sleep button
+#define SHARE_BUTTON_PIN  23    // GPIO for file share / sleep button
 #define SHARE_HOLD_TIME   1000  // Hold for 1 second to toggle file sharing (ms)
 #define SLEEP_HOLD_TIME   3000  // Hold for 3 seconds to enter deep sleep (ms)
 
@@ -78,24 +73,15 @@
 #define VOLTAGE_DIVIDER_RATIO 3.333333
 
 // Scan settings
-#define SCAN_INTERVAL 10  // WiFi, BLE, and Zigbee scan every x seconds
+#define SCAN_INTERVAL 10  // WiFi and BLE scan every x seconds
 #define BLE_SCAN_TIME 3      // BLE scan duration in seconds
-#define ZIGBEE_SCAN_DURATION 5  // Zigbee scan duration (1-14, higher = longer, ~3 seconds)
-
-// Zigbee settings
-// Note: Requires Arduino IDE settings:
-//   Tools -> Zigbee Mode -> Zigbee ZCZR (Coordinator/Router) [required for scanning]
-//   Tools -> Partition Scheme -> Zigbee 4MB with spiffs (or appropriate for your flash size)
-// ZCZR (Coordinator/Router) mode is required for network scanning
-// The "Network steering was not successful" warning is normal and can be ignored
-#define ENABLE_ZIGBEE_SCAN true  // Enable/disable Zigbee scanning
 
 // Scanner enable/disable flags
 #define ENABLE_WIFI_SCAN true    // Enable/disable WiFi scanning
 #define ENABLE_BLE_SCAN true     // Enable/disable Bluetooth scanning
 
 // Output enable/disable flags
-#define ENABLE_CONSOLE_OUTPUT true   // Enable/disable serial console output
+#define ENABLE_CONSOLE_OUTPUT false   // Enable/disable serial console output
 #define ENABLE_DISPLAY_OUTPUT true   // Enable/disable OLED display output
 #define ENABLE_LOG_OUTPUT true       // Enable/disable SD card logging
 
@@ -107,22 +93,17 @@ unsigned long lastDisplayUpdate = 0;
 // Active scanning flags (for display indicators)
 volatile bool wifiScanning = false;
 volatile bool bleScanning = false;
-volatile bool zigbeeScanning = false;
 
 // Cached device counts for display (reduces mutex contention)
 int cached_wifi_last = 0;
 int cached_ble_last = 0;
-int cached_zigbee_last = 0;
 int cached_wifi_total = 0;
 int cached_ble_total = 0;
-int cached_zigbee_total = 0;
 unsigned long lastCountsCacheUpdate = 0;
 #define COUNTS_CACHE_INTERVAL 200  // Update cached counts every 200ms
 
 // FreeRTOS Task Handles
-TaskHandle_t wifiScanTaskHandle = NULL;
-TaskHandle_t bleScanTaskHandle = NULL;
-TaskHandle_t zigbeeScanTaskHandle = NULL;
+TaskHandle_t unifiedScanTaskHandle = NULL;  // Single unified scan task for all scan types
 TaskHandle_t sdLogTaskHandle = NULL;
 
 // FreeRTOS Semaphores and Mutexes
@@ -153,16 +134,15 @@ bool logFileReady = false;
 #include <string>
 std::map<std::string, bool> seenWiFiDevices;    // Track unique WiFi devices by BSSID
 std::map<std::string, bool> seenBLEDevices;     // Track unique BLE devices by address
-std::map<std::string, bool> seenZigbeeNetworks; // Track unique Zigbee networks by Extended PAN ID
 int uniqueWiFiCount = 0;
 int uniqueBLECount = 0;
-int uniqueZigbeeCount = 0;
 int lastWiFiScanCount = 0;    // Devices found in last scan
 int lastBLEScanCount = 0;     // Devices found in last scan
-int lastZigbeeScanCount = 0;  // Networks found in last scan
 
-// Zigbee initialization flag
-bool zigbeeInitialized = false;
+// Memory protection: max entries per map before clearing (prevents heap exhaustion)
+// ~500 entries ≈ 25KB per map, total ~50KB for tracking
+// After clearing, unique counts remain accurate but duplicate detection resets
+#define MAX_DEVICE_MAP_ENTRIES 500
 
 // GPS variables
 TinyGPSPlus gps;
@@ -192,6 +172,10 @@ unsigned long lastBatteryRead = 0;
 
 // File sharing mode
 bool fileSharingMode = false;
+bool scanMode = false;  // Track if we're in scan mode
+bool scanTasksStarted = false;  // Whether scan tasks have been created (persists across mode toggles)
+unsigned long gpsWaitStart = 0; // When GPS wait began (for elapsed time display)
+int gpsWaitDotCount = 0;        // Dot animation counter for GPS wait console output
 String fileSharingIP;
 AsyncWebServer server(80);
 bool serverRoutesConfigured = false;
@@ -205,12 +189,13 @@ bool buttonPressed = false;
 
 BLEScan* pBLEScan;
 
-// BLE Scan callback class
+// BLE Scan callback class - single static instance to avoid memory leak
 class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
   void onResult(BLEAdvertisedDevice advertisedDevice) {
     // This will be called for each BLE device found during scan
   }
 };
+static MyAdvertisedDeviceCallbacks bleCallbacks;  // Single instance, reused every scan
 
 // Helper function to sanitize strings (remove non-printable ASCII and control characters)
 String sanitizeString(const String& input) {
@@ -360,7 +345,7 @@ bool generateLogFileName() {
     File logFile = SD.open(logFileName.c_str(), FILE_WRITE);
     if (logFile) {
       logFile.println("=== SignalScout Log File ===");
-      logFile.println("GPS-timestamped WiFi, Bluetooth, and Zigbee scan results");
+      logFile.println("GPS-timestamped WiFi and Bluetooth scan results");
       logFile.println();
       logFile.println("=== Column Headers ===");
       logFile.println();
@@ -369,9 +354,6 @@ bool generateLogFileName() {
       logFile.println();
       logFile.println("BLE Format:");
       logFile.println("Type,Fingerprint,Timestamp,Latitude,Longitude,Altitude,Satellites,HDOP,Name,Address,RSSI,ManufacturerData,ServiceUUID");
-      logFile.println();
-      logFile.println("ZIGBEE Format:");
-      logFile.println("Type,Fingerprint,Timestamp,Latitude,Longitude,Altitude,Satellites,HDOP,PAN_ID,ExtendedPAN_ID,Channel,PermitJoin,RouterCapacity,EndDeviceCapacity");
       logFile.println();
       logFile.close();
       consolePrintf("Log file created successfully: %s\n", logFileName.c_str());
@@ -386,52 +368,94 @@ bool generateLogFileName() {
   return false;
 }
 
-// FreeRTOS Task: WiFi Scanner
-void wifiScanTask(void* parameter) {
-  vTaskDelay(pdMS_TO_TICKS(0));  // No initial delay - WiFi scans first
+// FreeRTOS Task: Unified Scanner
+// Single unified scanning task - scans WiFi and BLE sequentially
+// ESP32-C5 has a shared 2.4GHz radio, so we must initialize/deinitialize
+// each radio type between scans to avoid conflicts
+void unifiedScanTask(void* parameter) {
+  consolePrintln("[Scan Task] Unified scanner started");
+
   while (true) {
-    if (logFileReady && ENABLE_WIFI_SCAN) {
-      consolePrintf("\n[WiFi Task] Starting WiFi scan at %lu ms\n", millis());
+    if (!logFileReady) {
+      vTaskDelay(pdMS_TO_TICKS(1000));  // Wait for log file to be ready
+      continue;
+    }
+
+    consolePrintln("\n========== SCAN CYCLE START ==========");
+    unsigned long cycleStart = millis();
+
+    // ===== WIFI SCAN =====
+    if (ENABLE_WIFI_SCAN) {
+      consolePrintln("\n[1/2] Initializing WiFi radio...");
+      WiFi.mode(WIFI_STA);
+      delay(300);  // Allow radio to initialize
+
       wifiScanning = true;
       scanWiFi();
       wifiScanning = false;
-    }
-    vTaskDelay(pdMS_TO_TICKS(SCAN_INTERVAL * 1000));  // Wait 10 seconds between scans
-  }
-}
 
-// FreeRTOS Task: Bluetooth Scanner
-void bleScanTask(void* parameter) {
-  vTaskDelay(pdMS_TO_TICKS(3500));  // Start after WiFi finishes (~3s scan + 0.5s buffer)
-  while (true) {
-    if (logFileReady && ENABLE_BLE_SCAN) {
-      consolePrintf("\n[BLE Task] Starting BLE scan at %lu ms\n", millis());
+      // Turn off WiFi radio before next scan type
+      consolePrintln("Releasing WiFi radio...");
+      WiFi.disconnect(true);
+      WiFi.mode(WIFI_OFF);
+      delay(500);  // Allow radio to fully release
+    }
+
+    // ===== BLE SCAN =====
+    if (ENABLE_BLE_SCAN) {
+      consolePrintln("\n[2/2] Initializing BLE radio...");
+
+      // Ensure clean state
+      if (BLEDevice::getInitialized()) {
+        BLEDevice::deinit(true);
+        delay(300);
+      }
+
+      BLEDevice::init("SignalScout");
+      delay(200);
+      pBLEScan = BLEDevice::getScan();
+      pBLEScan->setAdvertisedDeviceCallbacks(&bleCallbacks, false);  // Use static instance, don't take ownership
+      pBLEScan->setActiveScan(true);
+      pBLEScan->setInterval(100);
+      pBLEScan->setWindow(99);
+
       bleScanning = true;
       scanBluetooth();
       bleScanning = false;
+
+      // Deinitialize BLE before next scan type
+      consolePrintln("Releasing BLE radio...");
+      BLEDevice::deinit(true);
+      pBLEScan = NULL;
+      delay(500);  // Allow radio to fully release
     }
-    vTaskDelay(pdMS_TO_TICKS(SCAN_INTERVAL * 1000));  // Wait 10 seconds between scans
+
+    unsigned long cycleDuration = millis() - cycleStart;
+
+    // Memory monitoring: warn if heap is getting low
+    size_t freeHeap = ESP.getFreeHeap();
+    if (freeHeap < 30000) {
+      consolePrintf("WARNING: Low memory! Free heap: %u bytes\n", freeHeap);
+    }
+
+    consolePrintf("========== SCAN CYCLE COMPLETE (%lu ms, heap: %u) ==========\n", cycleDuration, freeHeap);
+
+    // Wait before next scan cycle (account for time already spent scanning)
+    unsigned long waitTime = (SCAN_INTERVAL * 1000) > cycleDuration ?
+                             (SCAN_INTERVAL * 1000) - cycleDuration : 1000;
+    consolePrintf("Next scan cycle in %lu ms\n", waitTime);
+    vTaskDelay(pdMS_TO_TICKS(waitTime));
   }
 }
-
-// FreeRTOS Task: Zigbee Scanner
-void zigbeeScanTask(void* parameter) {
-  vTaskDelay(pdMS_TO_TICKS(7000));  // Start after BLE finishes (~6.5s + 0.5s buffer)
-  while (true) {
-    if (logFileReady && ENABLE_ZIGBEE_SCAN && zigbeeInitialized) {
-      consolePrintf("\n[Zigbee Task] Starting Zigbee scan at %lu ms\n", millis());
-      zigbeeScanning = true;
-      scanZigbee();
-      zigbeeScanning = false;
-    }
-    vTaskDelay(pdMS_TO_TICKS(SCAN_INTERVAL * 1000));  // Wait 10 seconds between scans
-  }
-}
-
 
 // FreeRTOS Task: SD Card Logger (processes queue)
+// Uses fixed buffers to avoid heap fragmentation from String concatenation
 void sdLogTask(void* parameter) {
   LogEntry entry;
+  char logBuffer[512];  // Fixed buffer for log line (avoids heap fragmentation)
+  char timestamp[40];
+  char gpsLat[16], gpsLon[16], gpsAlt[12], gpsSats[8], gpsHdop[8];
+
   while (true) {
     // Wait for log entries in the queue
     if (xQueueReceive(logQueue, &entry, portMAX_DELAY) == pdTRUE) {
@@ -440,64 +464,72 @@ void sdLogTask(void* parameter) {
         if (xSemaphoreTake(sdCardMutex, portMAX_DELAY) == pdTRUE) {
           File logFile = SD.open(logFileName.c_str(), FILE_APPEND);
           if (logFile) {
-            // Get timestamp and GPS data
-            String timestamp;
-            String gpsLat = "N/A";
-            String gpsLon = "N/A";
-            String gpsAlt = "N/A";
-            String gpsSats = "N/A";
-            String gpsHdop = "N/A";
-
+            // Get timestamp and GPS data using fixed buffers
             if (gps.time.isValid() && gps.date.isValid()) {
-              char dateTime[32];
-              snprintf(dateTime, sizeof(dateTime), "%04d-%02d-%02d %02d:%02d:%02d",
+              snprintf(timestamp, sizeof(timestamp), "%04d-%02d-%02d %02d:%02d:%02d",
                        gps.date.year(), gps.date.month(), gps.date.day(),
                        gps.time.hour(), gps.time.minute(), gps.time.second());
-              timestamp = String(dateTime);
 
               if (gps.location.isValid()) {
-                gpsLat = String(gps.location.lat(), 6);
-                gpsLon = String(gps.location.lng(), 6);
+                snprintf(gpsLat, sizeof(gpsLat), "%.6f", gps.location.lat());
+                snprintf(gpsLon, sizeof(gpsLon), "%.6f", gps.location.lng());
+              } else {
+                strcpy(gpsLat, "N/A");
+                strcpy(gpsLon, "N/A");
               }
               if (gps.altitude.isValid()) {
-                gpsAlt = String(gps.altitude.meters(), 2);
+                snprintf(gpsAlt, sizeof(gpsAlt), "%.2f", gps.altitude.meters());
+              } else {
+                strcpy(gpsAlt, "N/A");
               }
               if (gps.satellites.isValid()) {
-                gpsSats = String(gps.satellites.value());
+                snprintf(gpsSats, sizeof(gpsSats), "%d", gps.satellites.value());
+              } else {
+                strcpy(gpsSats, "N/A");
               }
               if (gps.hdop.isValid()) {
-                gpsHdop = String(gps.hdop.hdop(), 2);
+                snprintf(gpsHdop, sizeof(gpsHdop), "%.2f", gps.hdop.hdop());
+              } else {
+                strcpy(gpsHdop, "N/A");
               }
             } else if (rtc.getYear() > 2020) {
-              char dateTime[32];
-              snprintf(dateTime, sizeof(dateTime), "%04d-%02d-%02d %02d:%02d:%02d",
+              snprintf(timestamp, sizeof(timestamp), "%04d-%02d-%02d %02d:%02d:%02d (RTC)",
                        rtc.getYear(), rtc.getMonth() + 1, rtc.getDay(),
                        rtc.getHour(true), rtc.getMinute(), rtc.getSecond());
-              timestamp = String(dateTime) + " (RTC)";
+              strcpy(gpsLat, "N/A");
+              strcpy(gpsLon, "N/A");
+              strcpy(gpsAlt, "N/A");
+              strcpy(gpsSats, "N/A");
+              strcpy(gpsHdop, "N/A");
             } else {
-              timestamp = String(millis()) + "ms";
+              snprintf(timestamp, sizeof(timestamp), "%lums", millis());
+              strcpy(gpsLat, "N/A");
+              strcpy(gpsLon, "N/A");
+              strcpy(gpsAlt, "N/A");
+              strcpy(gpsSats, "N/A");
+              strcpy(gpsHdop, "N/A");
             }
 
-            // Build log entry string
-            String logStr = String(entry.type) + "," + String(entry.fingerprint) + "," +
-                           timestamp + "," + gpsLat + "," + gpsLon + "," + gpsAlt + "," +
-                           gpsSats + "," + gpsHdop + ",";
-
-            if (String(entry.type) == "WIFI") {
-              logStr += String(entry.param1) + "," + String(entry.param2) + "," +
-                       String(entry.param3) + "," + String(entry.param4) + "," +
-                       String(entry.param5) + "," + String(entry.param6);
-            } else if (String(entry.type) == "BLE") {
-              logStr += String(entry.param1) + "," + String(entry.param2) + "," +
-                       String(entry.param3) + "," + String(entry.param4) + "," +
-                       String(entry.param5);
-            } else if (String(entry.type) == "ZIGBEE") {
-              logStr += String(entry.param1) + "," + String(entry.param2) + "," +
-                       String(entry.param3) + "," + String(entry.param4) + "," +
-                       String(entry.param5) + "," + String(entry.param6);
+            // Build log entry using fixed buffer (no String allocation)
+            if (strcmp(entry.type, "WIFI") == 0) {
+              snprintf(logBuffer, sizeof(logBuffer), "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s",
+                       entry.type, entry.fingerprint, timestamp,
+                       gpsLat, gpsLon, gpsAlt, gpsSats, gpsHdop,
+                       entry.param1, entry.param2, entry.param3,
+                       entry.param4, entry.param5, entry.param6);
+            } else if (strcmp(entry.type, "BLE") == 0) {
+              snprintf(logBuffer, sizeof(logBuffer), "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s",
+                       entry.type, entry.fingerprint, timestamp,
+                       gpsLat, gpsLon, gpsAlt, gpsSats, gpsHdop,
+                       entry.param1, entry.param2, entry.param3,
+                       entry.param4, entry.param5);
+            } else {
+              snprintf(logBuffer, sizeof(logBuffer), "%s,%s,%s,%s,%s,%s,%s,%s",
+                       entry.type, entry.fingerprint, timestamp,
+                       gpsLat, gpsLon, gpsAlt, gpsSats, gpsHdop);
             }
 
-            logFile.println(logStr);
+            logFile.println(logBuffer);
             logFile.close();
           } else {
             consolePrintln("ERROR: Failed to open log file in SD task");
@@ -519,7 +551,7 @@ void setup() {
   ledInitializing();  // Red: Starting initialization
 
   consolePrintln("\n\n=== BOOT START ===");
-  consolePrintln("SignalScout - WiFi, Bluetooth & Zigbee Scanner with GPS");
+  consolePrintln("SignalScout - WiFi & Bluetooth Scanner with GPS");
   consolePrintln("=========================================================");
 
   // Create FreeRTOS mutexes and queue
@@ -536,20 +568,23 @@ void setup() {
 
   // Initialize multi-function button for file sharing and deep sleep
   pinMode(SHARE_BUTTON_PIN, INPUT_PULLUP);  // Active LOW with internal pullup
-  consolePrintln("Share button initialized (GPIO7): 1s = file share, 3s = sleep");
+  consolePrintln("Share button initialized (GPIO23): 1s = mode toggle, 3s = sleep");
 
   // If waking from deep sleep, wait for button release to avoid immediate re-trigger
-  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_GPIO) {
-    consolePrintln("Woke from deep sleep - waiting for button release...");
+  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+  if (wakeup_reason == ESP_SLEEP_WAKEUP_GPIO || wakeup_reason == ESP_SLEEP_WAKEUP_EXT1) {
+    consolePrintln("Woke from deep sleep via GPIO - waiting for button release...");
     while (digitalRead(SHARE_BUTTON_PIN) == LOW) {
       delay(50);
     }
     consolePrintln("Button released, continuing boot");
+  } else if (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER) {
+    consolePrintln("Woke from deep sleep via timer (periodic wakeup)");
   }
 
   // ============================================
   // CRITICAL: Initialize SD card FIRST before any radio initialization
-  // The Zigbee/BLE radios can interfere with SPI if initialized first
+  // The BLE radio can interfere with SPI if initialized first
   // ============================================
   consolePrintln("\n[1/7] Initializing SD card (SPI)...");
   if (ENABLE_LOG_OUTPUT) {
@@ -662,231 +697,32 @@ void setup() {
     consolePrintln("WiFi scanning disabled in config");
   }
 
-  // Initialize BLE
-  consolePrintln("Initializing BLE...");
-  if (ENABLE_BLE_SCAN) {
-    BLEDevice::init("SignalScout");
-    pBLEScan = BLEDevice::getScan();
-    pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
-    pBLEScan->setActiveScan(true);
-    pBLEScan->setInterval(100);
-    pBLEScan->setWindow(99);
-    consolePrintln("BLE initialized");
-  } else {
-    consolePrintln("BLE scanning disabled in config");
-  }
-
-  // Initialize Zigbee LAST (IEEE 802.15.4)
-  // This must be after SD card to prevent SPI conflicts
-  consolePrintln("\n[7/7] Initializing Zigbee (IEEE 802.15.4)...");
-  if (ENABLE_ZIGBEE_SCAN) {
-    consolePrintln("NOTE: You may see 'No Zigbee EPs to register' - this is NORMAL and expected");
-    consolePrintln("      We are using Zigbee for scanning only, not as a device.");
-    // Note: Requires Arduino IDE settings:
-    //   Tools -> Zigbee Mode -> Zigbee ZCZR (Coordinator/Router)
-    //   Tools -> Partition Scheme -> Zigbee 4MB with spiffs
-    // Using ZIGBEE_ROUTER role for network scanning capability
-    Zigbee.setRebootOpenNetwork(0);  // Don't open network on reboot
-    if (Zigbee.begin(ZIGBEE_ROUTER, false)) {
-      zigbeeInitialized = true;
-      consolePrintln("Zigbee initialized successfully (Router mode for scanning)");
-    } else {
-      consolePrintln("WARNING: Zigbee initialization failed!");
-      consolePrintln("Check Arduino IDE: Tools -> Zigbee Mode -> Zigbee ZCZR");
-    }
-  } else {
-    consolePrintln("Zigbee scanning disabled in config");
-  }
-
-  // Wait for GPS signal before starting scans
-  ledWaitingGPS();  // Orange: Waiting for GPS
-  consolePrintln("\nWaiting for GPS signal...");
-
-  // Initial display update (before tasks are started, no mutex needed)
-  if (ENABLE_DISPLAY_OUTPUT) {
-    display.clearDisplay();
-    display.setTextSize(1);
-    display.setCursor(0, 0);
-    display.println("Waiting for GPS");
-    display.display();
-  }
-
-  unsigned long gpsWaitStart = millis();
-  unsigned long lastGPSStatusUpdate = 0;
-  int dotCount = 0;
-
-  while (!gps.location.isValid() || !gps.time.isValid()) {
-    // Read GPS data
-    while (gpsSerial.available() > 0) {
-      gps.encode(gpsSerial.read());
-    }
-
-    // Update display and console periodically
-    if (millis() - lastGPSStatusUpdate > 1000) {
-      lastGPSStatusUpdate = millis();
-      dotCount = (dotCount + 1) % 4;
-
-      // Build status string with dots
-      String dots = "";
-      for (int i = 0; i < dotCount; i++) dots += ".";
-
-      int sats = gps.satellites.isValid() ? gps.satellites.value() : 0;
-      consolePrintf("Waiting for GPS fix%s (Satellites: %d)\n", dots.c_str(), sats);
-
-      if (ENABLE_DISPLAY_OUTPUT) {
-        display.clearDisplay();
-        display.setTextSize(1);
-        display.setCursor(0, 0);
-        display.println("Waiting for GPS");
-        display.setCursor(0, 16);
-        display.printf("Satellites: %d", sats);
-        display.setCursor(0, 32);
-        unsigned long elapsed = (millis() - gpsWaitStart) / 1000;
-        display.printf("Elapsed: %lus", elapsed);
-
-        // Show battery during GPS wait
-        display.setCursor(0, 48);
-        display.printf("Battery: %d%%", readBatteryPercent());
-
-        display.display();
-      }
-    }
-
-    delay(100);
-  }
-
-  // GPS signal acquired!
-  gpsTimeValid = true;
-  consolePrintln("\nGPS signal acquired!");
-  displayGPSInfo();
-
-  // Sync RTC from GPS
-  rtc.setTime(gps.time.second(), gps.time.minute(), gps.time.hour(),
-              gps.date.day(), gps.date.month(), gps.date.year());
-  rtcSyncedFromGPS = true;
-  consolePrintln("RTC synced from GPS time!");
-
-  // Generate log filename now that we have valid time
-  consolePrintln("\nCreating log file...");
-  if (ENABLE_LOG_OUTPUT && sdCardMounted) {
-    if (generateLogFileName()) {
-      logFileReady = true;
-      logToFile("System started - SignalScout initialized");
-      logToFile("GPS signal acquired");
-      consolePrintf("Logging to: %s\n", logFileName.c_str());
-    } else {
-      consolePrintln("ERROR: Failed to create log file!");
-      logFileReady = false;
-    }
-  } else {
-    consolePrintln("WARNING: SD card not mounted - logging disabled");
-    logFileReady = false;
-  }
-
-  // Setup complete
-  ledReady();  // Green: Ready
-  consolePrintln("\nInitialization complete. Starting tasks...\n");
-
-  // Check available heap before creating tasks
-  consolePrintf("\nFree heap before task creation: %u bytes\n", ESP.getFreeHeap());
-  consolePrintf("Largest free block: %u bytes\n", ESP.getMaxAllocHeap());
-
-  // Create FreeRTOS tasks
-  consolePrintln("\nCreating FreeRTOS tasks...");
-
-  // SD Logger Task (only create if SD card is mounted and logging enabled)
-  if (ENABLE_LOG_OUTPUT && sdCardMounted && logFileReady) {
-    BaseType_t result = xTaskCreate(
-      sdLogTask,           // Task function
-      "SD Logger",         // Task name
-      3072,                // Stack size (bytes) - reduced
-      NULL,                // Parameters
-      3,                   // Priority (0-24, higher = more priority)
-      &sdLogTaskHandle     // Task handle
-    );
-    if (result != pdPASS) {
-      consolePrintln("ERROR: Failed to create SD Logger task!");
-    } else {
-      consolePrintln("SD Logger task created");
-    }
-  } else {
-    consolePrintln("SD Logger task skipped (SD card not ready)");
-  }
-
-  // WiFi Scan Task
-  if (ENABLE_WIFI_SCAN) {
-    BaseType_t result = xTaskCreate(
-      wifiScanTask,        // Task function
-      "WiFi Scanner",      // Task name
-      4096,                // Stack size (reduced from 8192)
-      NULL,                // Parameters
-      1,                   // Priority
-      &wifiScanTaskHandle  // Task handle
-    );
-    if (result != pdPASS) {
-      consolePrintln("ERROR: Failed to create WiFi Scanner task!");
-    } else {
-      consolePrintln("WiFi Scanner task created");
-    }
-  } else {
-    consolePrintln("WiFi Scanner task skipped (WiFi scanning disabled)");
-  }
-
-  // BLE Scan Task
-  if (ENABLE_BLE_SCAN) {
-    BaseType_t result = xTaskCreate(
-      bleScanTask,         // Task function
-      "BLE Scanner",       // Task name
-      4096,                // Stack size (reduced from 8192)
-      NULL,                // Parameters
-      1,                   // Priority
-      &bleScanTaskHandle   // Task handle
-    );
-    if (result != pdPASS) {
-      consolePrintln("ERROR: Failed to create BLE Scanner task!");
-    } else {
-      consolePrintln("BLE Scanner task created");
-    }
-  } else {
-    consolePrintln("BLE Scanner task skipped (BLE scanning disabled)");
-  }
-
-  // Zigbee Scan Task
-  if (ENABLE_ZIGBEE_SCAN && zigbeeInitialized) {
-    BaseType_t result = xTaskCreate(
-      zigbeeScanTask,        // Task function
-      "Zigbee Scanner",      // Task name
-      4096,                  // Stack size (reduced from 8192)
-      NULL,                  // Parameters
-      1,                     // Priority
-      &zigbeeScanTaskHandle  // Task handle
-    );
-    if (result != pdPASS) {
-      consolePrintln("ERROR: Failed to create Zigbee Scanner task!");
-    } else {
-      consolePrintln("Zigbee Scanner task created");
-    }
-  }
-
-  consolePrintln("FreeRTOS task creation complete!");
-
-  // Check heap after task creation
-  consolePrintf("\nFree heap after task creation: %u bytes\n", ESP.getFreeHeap());
-  consolePrintf("Minimum free heap ever: %u bytes\n", ESP.getMinFreeHeap());
-
-  // Brief pause to show green LED
-  delay(1000);
-
-  // Turn off LED to conserve battery
-  setLEDOff();
-  consolePrintln("Status LED turned off to conserve battery");
+  // Skip BLE initialization on boot - it will be initialized by the unified scan task
+  consolePrintln("Skipping BLE init (will initialize when scan task starts)");
+  consolePrintln("\n[7/7] Skipped - BLE deferred to scan task");
 
   // Configure deep sleep wakeup source (GPIO wakeup - share button)
-  gpio_wakeup_enable((gpio_num_t)SHARE_BUTTON_PIN, GPIO_INTR_LOW_LEVEL);
-  esp_sleep_enable_gpio_wakeup();
-  consolePrintln("Deep sleep wakeup configured (press button to wake)");
+  // For ESP32-C5, use the deep sleep GPIO wakeup (available on newer ESP32 variants)
+  // Note: GPIO must support deep sleep wakeup (RTC domain GPIO)
+  uint64_t wakeup_pin_mask = 1ULL << SHARE_BUTTON_PIN;
+  esp_err_t wakeup_result = esp_deep_sleep_enable_gpio_wakeup(wakeup_pin_mask, ESP_GPIO_WAKEUP_GPIO_LOW);
+  if (wakeup_result == ESP_OK) {
+    consolePrintln("Deep sleep GPIO wakeup configured (press button to wake)");
+  } else {
+    consolePrintf("WARNING: GPIO%d may not support deep sleep wakeup (error: %d)\n", SHARE_BUTTON_PIN, wakeup_result);
+    consolePrintln("You may need to reset/power cycle to wake from deep sleep");
+    // Fallback: enable timer wakeup as backup (wake every 60 seconds to check button)
+    esp_sleep_enable_timer_wakeup(60 * 1000000ULL); // 60 seconds
+    consolePrintln("Timer wakeup enabled as fallback (60s intervals)");
+  }
 
-  consolePrintln("\nEntering main loop (GPS monitoring, battery checks, and display updates)...\n");
+  // Setup complete - default to scan mode; GPS wait runs non-blocking in loop()
+  consolePrintln("\n=== INITIALIZATION COMPLETE ===");
+  consolePrintln("Scan mode default - waiting for GPS (press button to switch to file sharing)...\n");
+
+  scanMode = true;
+  gpsWaitStart = millis();
+  ledWaitingGPS();  // Orange: waiting for GPS
 }
 
 void loop() {
@@ -913,15 +749,30 @@ void loop() {
     }
   }
 
+  // Scan mode: non-blocking GPS wait then start tasks (button still works during wait)
+  if (scanMode && !scanTasksStarted) {
+    if (gps.location.isValid() && gps.time.isValid()) {
+      // GPS acquired - sync RTC and start scanning
+      gpsTimeValid = true;
+      consolePrintln("\nGPS signal acquired!");
+      displayGPSInfo();
+
+      rtc.setTime(gps.time.second(), gps.time.minute(), gps.time.hour(),
+                  gps.date.day(), gps.date.month(), gps.date.year());
+      rtcSyncedFromGPS = true;
+      consolePrintln("RTC synced from GPS time!");
+
+      startScanTasks();
+    }
+  }
+
   // Update cached device counts periodically (reduces mutex contention during display updates)
   if (currentTime - lastCountsCacheUpdate >= COUNTS_CACHE_INTERVAL) {
     if (xSemaphoreTake(deviceMapMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
       cached_wifi_last = lastWiFiScanCount;
       cached_ble_last = lastBLEScanCount;
-      cached_zigbee_last = lastZigbeeScanCount;
       cached_wifi_total = uniqueWiFiCount;
       cached_ble_total = uniqueBLECount;
-      cached_zigbee_total = uniqueZigbeeCount;
       xSemaphoreGive(deviceMapMutex);
       lastCountsCacheUpdate = currentTime;
     }
@@ -937,14 +788,16 @@ void loop() {
   if (ENABLE_DISPLAY_OUTPUT && currentTime - lastDisplayUpdate >= DISPLAY_UPDATE_INTERVAL) {
     if (fileSharingMode) {
       updateDisplayFileSharing();
+    } else if (scanMode && !scanTasksStarted) {
+      updateDisplayGPSWait();
     } else {
       updateDisplay("");
     }
     lastDisplayUpdate = currentTime;
   }
 
-  // Multi-function button (SHARE_BUTTON_PIN on GPIO7)
-  // Hold and release between 1-3s: toggle file sharing mode
+  // Multi-function button (SHARE_BUTTON_PIN on GPIO23)
+  // Hold and release between 1-3s: toggle between file sharing mode and scan mode
   // Hold 3s (while still held): enter deep sleep
   bool shareButtonState = (digitalRead(SHARE_BUTTON_PIN) == LOW);
 
@@ -956,20 +809,21 @@ void loop() {
     // Button is being held, check for 3-second sleep threshold
     unsigned long holdDuration = currentTime - buttonPressStart;
     if (holdDuration >= SLEEP_HOLD_TIME) {
-      if (fileSharingMode) {
-        exitFileSharingMode();
+      if (scanMode) {
+        exitScanMode();
       }
       enterDeepSleep();
       // enterDeepSleep() does not return - device reboots on wake
     }
   } else if (!shareButtonState && buttonPressed) {
-    // Button released - check if held long enough for file share toggle
+    // Button released - check if held long enough for mode toggle
     unsigned long holdDuration = currentTime - buttonPressStart;
-    if (holdDuration >= SHARE_HOLD_TIME) {
-      if (!fileSharingMode) {
-        enterFileSharingMode();
+    if (holdDuration >= SHARE_HOLD_TIME && holdDuration < SLEEP_HOLD_TIME) {
+      // Toggle between scan mode and file sharing mode
+      if (scanMode) {
+        exitScanMode();
       } else {
-        exitFileSharingMode();
+        enterScanMode();
       }
     }
     buttonPressed = false;
@@ -1096,17 +950,60 @@ void enterFileSharingMode() {
   consolePrintln("\n=== ENTERING FILE SHARING MODE ===");
   fileSharingMode = true;
 
-  // Suspend all scanning and logging tasks to avoid SD and radio conflicts
-  if (wifiScanTaskHandle) vTaskSuspend(wifiScanTaskHandle);
-  if (bleScanTaskHandle) vTaskSuspend(bleScanTaskHandle);
-  if (zigbeeScanTaskHandle) vTaskSuspend(zigbeeScanTaskHandle);
-  if (sdLogTaskHandle) vTaskSuspend(sdLogTaskHandle);
+  // Suspend scanning and logging tasks to avoid SD and radio conflicts (if they exist)
+  if (unifiedScanTaskHandle != NULL) vTaskSuspend(unifiedScanTaskHandle);
+  if (sdLogTaskHandle != NULL) vTaskSuspend(sdLogTaskHandle);
+
+  // Deinitialize BLE to free up 2.4GHz radio for WiFi (if it was initialized)
+  // BLE and WiFi share radio resources on ESP32-C5
+  // The unified scan task releases radios after each scan, but we double-check here
+  if (ENABLE_BLE_SCAN && BLEDevice::getInitialized()) {
+    consolePrintln("Deinitializing BLE to free radio for WiFi...");
+    BLEDevice::deinit(true);  // true = release all BLE memory for clean radio handoff
+    pBLEScan = NULL;          // Mark as deinitialized
+    delay(500);  // Allow BLE to fully release radio (increased for ESP32-C5)
+  }
 
   // Connect to WiFi using credentials from secrets.h
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  consolePrintf("Connecting to WiFi: %s\n", WIFI_SSID);
+  // Full WiFi radio reset sequence for ESP32-C5 shared radio
+  // (BLE/WiFi share the 2.4GHz radio, needs clean handoff)
+  WiFi.mode(WIFI_OFF);    // Completely turn off WiFi radio
+  delay(1000);            // Allow radio to fully release (longer for ESP32-C5)
 
+  WiFi.persistent(false); // Don't save credentials to flash (avoids flash wear and corruption issues)
+  WiFi.setAutoReconnect(false);  // We handle reconnection ourselves
+  WiFi.mode(WIFI_STA);
+  delay(500);             // Stabilization delay after mode change
+
+  // Configure WiFi for better 5GHz compatibility
+  // ESP32-C5 may have issues with 5GHz after BLE radio release
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);  // Max TX power for better range
+  WiFi.setSleep(false);                  // Disable modem sleep for reliable connection
+
+  // Perform a full scan to warm up the radio before connecting
+  // This helps stabilize the radio after BLE handoff
+  consolePrintln("Scanning to warm up radio...");
+  int numNetworks = WiFi.scanNetworks();  // Full scan with default timing
+  consolePrintf("Found %d networks\n", numNetworks);
+
+  // Check if our target network is visible
+  bool foundNetwork = false;
+  for (int i = 0; i < numNetworks; i++) {
+    if (WiFi.SSID(i) == WIFI_SSID) {
+      consolePrintf("  Target found: %s (RSSI: %d, Ch: %d)\n",
+                    WiFi.SSID(i).c_str(), WiFi.RSSI(i), WiFi.channel(i));
+      foundNetwork = true;
+    }
+  }
+  WiFi.scanDelete();  // Free scan results memory
+
+  if (!foundNetwork) {
+    consolePrintf("WARNING: Network '%s' not found in scan, trying anyway...\n", WIFI_SSID);
+  }
+
+  // Simple connection - let ESP32 driver choose best AP
+  consolePrintf("Connecting to WiFi: %s\n", WIFI_SSID);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   if (ENABLE_DISPLAY_OUTPUT) {
     display.clearDisplay();
     display.setTextSize(1);
@@ -1117,23 +1014,73 @@ void enterFileSharingMode() {
     display.display();
   }
 
-  // Wait for connection with 10-second timeout
-  unsigned long wifiTimeout = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - wifiTimeout < 10000) {
-    delay(250);
-    consolePrint(".");
-  }
-  consolePrintln("");
+  // Try connecting with retries - ESP32-C5 sometimes needs multiple attempts after radio switch
+  bool connected = false;
+  for (int retry = 0; retry < 3 && !connected; retry++) {
+    if (retry > 0) {
+      consolePrintf("\nRetry %d/3 - Resetting WiFi...\n", retry + 1);
+      WiFi.disconnect(true);
+      delay(500);
+      WiFi.mode(WIFI_OFF);
+      delay(500);
+      WiFi.mode(WIFI_STA);
+      delay(500);
+      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    }
 
-  if (WiFi.status() != WL_CONNECTED) {
-    consolePrintln("ERROR: Failed to connect to WiFi!");
+    consolePrintf("Waiting for connection (attempt %d/3, timeout: 10s)...\n", retry + 1);
+
+    // Wait for connection with 10-second timeout
+    for (int attempt = 0; attempt < 10 && WiFi.status() != WL_CONNECTED; attempt++) {
+      delay(1000);
+      wl_status_t status = WiFi.status();
+      consolePrintf("  %ds - Status: %d", attempt + 1, status);
+      if (status == WL_CONNECT_FAILED) {
+        consolePrintln(" (CONNECT_FAILED - bad password?)");
+        break;  // Don't waste time if password is wrong
+      } else if (status == WL_NO_SSID_AVAIL) {
+        consolePrintln(" (NO_SSID - network not found)");
+      } else {
+        consolePrintln("");
+      }
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+      connected = true;
+    }
+  }
+
+  if (!connected) {
+    wl_status_t status = WiFi.status();
+    consolePrintf("ERROR: Failed to connect to WiFi! Status: %d\n", status);
+    consolePrintf("Status meanings: 0=IDLE, 1=NO_SSID, 3=CONNECTED, 4=CONNECT_FAILED, 6=DISCONNECTED\n");
+    consolePrintf("SSID: '%s' (length: %d)\n", WIFI_SSID, strlen(WIFI_SSID));
     consolePrintln("Check SSID and password in secrets.h");
+
+    // Print available networks for debugging
+    consolePrintln("Scanning for available networks...");
+    // Reset WiFi to clean state for scanning
+    WiFi.disconnect(true);
+    delay(200);
+    WiFi.mode(WIFI_OFF);
+    delay(300);
+    WiFi.mode(WIFI_STA);
+    delay(500);
+    int n = WiFi.scanNetworks();
+    if (n == 0) {
+      consolePrintln("  No networks found");
+    } else if (n < 0) {
+      consolePrintf("  Scan failed with error: %d\n", n);
+    } else {
+      for (int i = 0; i < n && i < 5; i++) {
+        consolePrintf("  %d: %s (RSSI: %d)\n", i+1, WiFi.SSID(i).c_str(), WiFi.RSSI(i));
+      }
+    }
+
     fileSharingMode = false;
 
     // Resume tasks on failure
-    if (wifiScanTaskHandle) vTaskResume(wifiScanTaskHandle);
-    if (bleScanTaskHandle) vTaskResume(bleScanTaskHandle);
-    if (zigbeeScanTaskHandle) vTaskResume(zigbeeScanTaskHandle);
+    if (unifiedScanTaskHandle) vTaskResume(unifiedScanTaskHandle);
     if (sdLogTaskHandle) vTaskResume(sdLogTaskHandle);
 
     if (ENABLE_DISPLAY_OUTPUT) {
@@ -1174,21 +1121,150 @@ void exitFileSharingMode() {
     logToFile("Exiting file sharing mode");
   }
 
-  // Stop web server and disconnect WiFi
+  // Stop web server and fully turn off WiFi to release radio for BLE
   server.end();
-  WiFi.disconnect();
-  delay(500);
+  WiFi.disconnect(true);  // Disconnect and clear credentials
+  delay(200);
+  WiFi.mode(WIFI_OFF);    // Fully turn off WiFi radio
+  delay(500);             // Allow radio to fully release
 
   fileSharingMode = false;
 
-  // Resume all scanning and logging tasks
-  if (wifiScanTaskHandle) vTaskResume(wifiScanTaskHandle);
-  if (bleScanTaskHandle) vTaskResume(bleScanTaskHandle);
-  if (zigbeeScanTaskHandle) vTaskResume(zigbeeScanTaskHandle);
-  if (sdLogTaskHandle) vTaskResume(sdLogTaskHandle);
-
   setLEDOff();
-  consolePrintln("File sharing mode exited, scanning resumed");
+  consolePrintln("File sharing mode exited, WiFi radio released");
+}
+
+void enterScanMode() {
+  consolePrintln("\n=== ENTERING SCAN MODE ===");
+
+  // Exit file sharing mode if active
+  if (fileSharingMode) {
+    exitFileSharingMode();
+  }
+
+  scanMode = true;
+
+  if (scanTasksStarted) {
+    // Tasks already created previously (we're returning from file sharing) - resume them
+    consolePrintln("Resuming scan tasks...");
+    if (unifiedScanTaskHandle != NULL) vTaskResume(unifiedScanTaskHandle);
+    if (sdLogTaskHandle != NULL) vTaskResume(sdLogTaskHandle);
+    if (ENABLE_LOG_OUTPUT && logFileReady) {
+      logToFile("Entering scan mode");
+    }
+    setLEDOff();
+    consolePrintln("Scan mode active!\n");
+  } else if (gps.location.isValid() && gps.time.isValid()) {
+    // GPS already acquired (e.g. acquired while in file sharing) - start tasks now
+    consolePrintln("GPS already available, starting tasks immediately");
+    gpsTimeValid = true;
+    if (!rtcSyncedFromGPS) {
+      rtc.setTime(gps.time.second(), gps.time.minute(), gps.time.hour(),
+                  gps.date.day(), gps.date.month(), gps.date.year());
+      rtcSyncedFromGPS = true;
+      consolePrintln("RTC synced from GPS time!");
+    }
+    startScanTasks();
+  } else {
+    // GPS not yet acquired - loop() will poll and call startScanTasks() when ready
+    consolePrintln("Waiting for GPS signal (non-blocking)...");
+    gpsWaitStart = millis();
+    ledWaitingGPS();  // Orange: waiting for GPS
+  }
+}
+
+// Create log file and FreeRTOS scan/log tasks. Called once when GPS first locks.
+void startScanTasks() {
+  consolePrintln("\n=== STARTING SCAN TASKS ===");
+
+  // Generate log filename if not already created
+  if (!logFileReady && ENABLE_LOG_OUTPUT && sdCardMounted) {
+    consolePrintln("Creating log file...");
+    if (generateLogFileName()) {
+      logFileReady = true;
+      logToFile("System started - SignalScout initialized");
+      logToFile("GPS signal acquired");
+      logToFile("Entering scan mode");
+      consolePrintf("Logging to: %s\n", logFileName.c_str());
+    } else {
+      consolePrintln("ERROR: Failed to create log file!");
+      logFileReady = false;
+    }
+  } else if (ENABLE_LOG_OUTPUT && logFileReady) {
+    logToFile("Entering scan mode");
+  }
+
+  // SD Logger Task (only create if SD card is mounted and logging enabled)
+  if (ENABLE_LOG_OUTPUT && sdCardMounted && logFileReady) {
+    if (sdLogTaskHandle == NULL) {
+      BaseType_t result = xTaskCreate(
+        sdLogTask,           // Task function
+        "SD Logger",         // Task name
+        3072,                // Stack size (bytes)
+        NULL,                // Parameters
+        3,                   // Priority (0-24, higher = more priority)
+        &sdLogTaskHandle     // Task handle
+      );
+      if (result != pdPASS) {
+        consolePrintln("ERROR: Failed to create SD Logger task!");
+      } else {
+        consolePrintln("SD Logger task created");
+      }
+    } else {
+      vTaskResume(sdLogTaskHandle);
+      consolePrintln("SD Logger task resumed");
+    }
+  }
+
+  // Unified Scan Task - handles WiFi and BLE sequentially
+  // This ensures only one radio type is active at a time on ESP32-C5's shared radio
+  if (ENABLE_WIFI_SCAN || ENABLE_BLE_SCAN) {
+    if (unifiedScanTaskHandle == NULL) {
+      BaseType_t result = xTaskCreate(
+        unifiedScanTask,       // Task function
+        "Unified Scanner",     // Task name
+        8192,                  // Stack size (larger for all scan types)
+        NULL,                  // Parameters
+        1,                     // Priority
+        &unifiedScanTaskHandle // Task handle
+      );
+      if (result != pdPASS) {
+        consolePrintln("ERROR: Failed to create Unified Scanner task!");
+      } else {
+        consolePrintln("Unified Scanner task created (WiFi->BLE sequential)");
+      }
+    } else {
+      vTaskResume(unifiedScanTaskHandle);
+      consolePrintln("Unified Scanner task resumed");
+    }
+  }
+
+  ledReady();  // Green: Ready
+  delay(1000);  // Brief pause to show green LED
+  setLEDOff();  // Turn off LED to conserve battery
+
+  scanTasksStarted = true;
+  consolePrintln("Scan tasks started!\n");
+}
+
+void exitScanMode() {
+  consolePrintln("\n=== EXITING SCAN MODE ===");
+
+  if (ENABLE_LOG_OUTPUT && logFileReady) {
+    logToFile("Exiting scan mode");
+  }
+
+  // Suspend scanning and logging tasks (only if they were started)
+  if (scanTasksStarted) {
+    if (unifiedScanTaskHandle != NULL) vTaskSuspend(unifiedScanTaskHandle);
+    if (sdLogTaskHandle != NULL) vTaskSuspend(sdLogTaskHandle);
+    consolePrintln("Scanning tasks suspended");
+  }
+
+  scanMode = false;
+
+  // Enter file sharing mode
+  enterFileSharingMode();
 }
 
 void updateDisplayFileSharing() {
@@ -1201,8 +1277,30 @@ void updateDisplayFileSharing() {
   display.print("IP: ");
   display.println(fileSharingIP);
   display.setCursor(2, 38);
-  display.println("Hold 1s: exit");
+  display.println("Hold 1s: scan mode");
   display.setCursor(2, 50);
+  display.println("Hold 3s: sleep");
+  display.display();
+}
+
+void updateDisplayGPSWait() {
+  gpsWaitDotCount = (gpsWaitDotCount + 1) % 4;
+  int sats = gps.satellites.isValid() ? gps.satellites.value() : 0;
+  unsigned long elapsed = (millis() - gpsWaitStart) / 1000;
+
+  consolePrintf("Waiting for GPS fix (Satellites: %d, Elapsed: %lus)\n", sats, elapsed);
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("Waiting for GPS...");
+  display.setCursor(0, 12);
+  display.printf("Sats: %d  Time: %lus", sats, elapsed);
+  display.setCursor(0, 24);
+  display.printf("Battery: %d%%", batteryPercent);
+  display.setCursor(0, 40);
+  display.println("Hold 1s: file share");
+  display.setCursor(0, 52);
   display.println("Hold 3s: sleep");
   display.display();
 }
@@ -1299,6 +1397,11 @@ void scanWiFi() {
 
     // Track unique devices by BSSID (with mutex protection)
     if (xSemaphoreTake(deviceMapMutex, portMAX_DELAY) == pdTRUE) {
+      // Memory protection: clear map if it grows too large
+      if (seenWiFiDevices.size() >= MAX_DEVICE_MAP_ENTRIES) {
+        seenWiFiDevices.clear();
+        consolePrintln("WARNING: WiFi device map cleared to prevent memory exhaustion");
+      }
       std::string bssidKey(bssidStr);
       if (seenWiFiDevices.find(bssidKey) == seenWiFiDevices.end()) {
         seenWiFiDevices[bssidKey] = true;
@@ -1386,6 +1489,11 @@ void scanBluetooth() {
 
     // Track unique devices by address (with mutex protection)
     if (xSemaphoreTake(deviceMapMutex, portMAX_DELAY) == pdTRUE) {
+      // Memory protection: clear map if it grows too large
+      if (seenBLEDevices.size() >= MAX_DEVICE_MAP_ENTRIES) {
+        seenBLEDevices.clear();
+        consolePrintln("WARNING: BLE device map cleared to prevent memory exhaustion");
+      }
       std::string addrKey = address.c_str();
       if (seenBLEDevices.find(addrKey) == seenBLEDevices.end()) {
         seenBLEDevices[addrKey] = true;
@@ -1464,143 +1572,6 @@ void scanBluetooth() {
 
   pBLEScan->clearResults();
   consolePrintln("--- Bluetooth Scan Complete ---\n");
-}
-
-void scanZigbee() {
-  consolePrintln("\n--- Zigbee Scan Starting (IEEE 802.15.4) ---");
-
-  // Note: "Network steering was not successful" warning is normal for scanning-only mode
-  // We're not trying to join a network, just scanning for nearby networks
-
-  // Start network scan on all Zigbee channels (11-26)
-  // This sends beacon requests and listens for responses
-  Zigbee.scanNetworks();
-
-  // Wait for scan to complete
-  int16_t scanStatus;
-  unsigned long scanStart = millis();
-  unsigned long timeout = 30000;  // 30 second timeout
-
-  do {
-    scanStatus = Zigbee.scanComplete();
-    delay(100);
-
-    // Check for timeout
-    if (millis() - scanStart > timeout) {
-      consolePrintln("Zigbee scan timeout");
-      lastZigbeeScanCount = 0;
-      return;
-    }
-  } while (scanStatus == ZB_SCAN_RUNNING);
-
-  // Check scan result
-  if (scanStatus == ZB_SCAN_FAILED) {
-    consolePrintln("Zigbee scan failed");
-    lastZigbeeScanCount = 0;
-    return;
-  }
-
-  int networkCount = scanStatus;
-  lastZigbeeScanCount = networkCount;
-
-  consolePrintf("Zigbee networks found: %d\n", networkCount);
-
-  if (networkCount == 0) {
-    consolePrintln("No Zigbee networks found");
-    return;
-  }
-
-  // Get pointer to scan results array
-  zigbee_scan_result_t* scanResults = Zigbee.getScanResult();
-  if (scanResults == NULL) {
-    consolePrintln("Failed to get scan results");
-    return;
-  }
-
-  // Process each network found
-  for (int i = 0; i < networkCount; i++) {
-    // Access result at index i
-    zigbee_scan_result_t* network = &scanResults[i];
-
-    // Format Extended PAN ID (8 bytes, reversed order)
-    char extPanIdStr[24];
-    snprintf(extPanIdStr, sizeof(extPanIdStr), "%02X:%02X:%02X:%02X:%02X:%02X:%02X:%02X",
-             network->extended_pan_id[7], network->extended_pan_id[6],
-             network->extended_pan_id[5], network->extended_pan_id[4],
-             network->extended_pan_id[3], network->extended_pan_id[2],
-             network->extended_pan_id[1], network->extended_pan_id[0]);
-
-    // Format PAN ID (2 bytes) - use short_pan_id field
-    char panIdStr[8];
-    snprintf(panIdStr, sizeof(panIdStr), "0x%04X", network->short_pan_id);
-
-    // Track unique networks by Extended PAN ID (with mutex protection)
-    if (xSemaphoreTake(deviceMapMutex, portMAX_DELAY) == pdTRUE) {
-      std::string extPanIdKey(extPanIdStr);
-      if (seenZigbeeNetworks.find(extPanIdKey) == seenZigbeeNetworks.end()) {
-        seenZigbeeNetworks[extPanIdKey] = true;
-        uniqueZigbeeCount++;
-      }
-      xSemaphoreGive(deviceMapMutex);
-    }
-
-    // Get channel number
-    uint8_t channel = network->logic_channel;
-
-    // Get network characteristics
-    bool permitJoining = network->permit_joining;
-    bool routerCapacity = network->router_capacity;
-    bool endDeviceCapacity = network->end_device_capacity;
-
-    // Generate fingerprint from Extended PAN ID only (stable network identifier)
-    // Use the 8-byte Extended PAN ID directly
-    uint32_t fingerprint = 0;
-    for (int j = 0; j < 8; j++) {
-      fingerprint = (fingerprint << 8) | network->extended_pan_id[j];
-    }
-    // Add entropy
-    fingerprint = (fingerprint ^ (fingerprint >> 16)) * 0x45d9f3b;
-    fingerprint = (fingerprint ^ (fingerprint >> 16)) * 0x45d9f3b;
-    fingerprint = fingerprint ^ (fingerprint >> 16);
-
-    char fingerprintStr[9];
-    snprintf(fingerprintStr, sizeof(fingerprintStr), "%08X", fingerprint);
-
-    // Print to Serial
-    consolePrintf("%d: PAN: %s | ExtPAN: %s | Ch: %d | Join: %s | FP: %s\n",
-                  i + 1, panIdStr, extPanIdStr, channel,
-                  permitJoining ? "Yes" : "No", fingerprintStr);
-    consolePrintf("   Router Cap: %s | End Device Cap: %s\n",
-                  routerCapacity ? "Yes" : "No",
-                  endDeviceCapacity ? "Yes" : "No");
-
-    // Queue log entry for SD card writing (non-blocking)
-    if (ENABLE_LOG_OUTPUT && logFileReady) {
-      LogEntry entry;
-      // Zero out the entire structure first to ensure no garbage
-      memset(&entry, 0, sizeof(LogEntry));
-
-      // Use safe copy functions with guaranteed null-termination
-      safeCopy(entry.type, sizeof(entry.type), "ZIGBEE");
-      safeCopy(entry.fingerprint, sizeof(entry.fingerprint), fingerprintStr);
-      safeCopy(entry.param1, sizeof(entry.param1), panIdStr);
-      safeCopy(entry.param2, sizeof(entry.param2), extPanIdStr);
-      snprintf(entry.param3, sizeof(entry.param3), "%d", channel);
-      safeCopy(entry.param4, sizeof(entry.param4), permitJoining ? "Yes" : "No");
-      safeCopy(entry.param5, sizeof(entry.param5), routerCapacity ? "Yes" : "No");
-      safeCopy(entry.param6, sizeof(entry.param6), endDeviceCapacity ? "Yes" : "No");
-
-      // Try to add to queue (don't block if queue is full)
-      if (xQueueSend(logQueue, &entry, 0) != pdTRUE) {
-        consolePrintln("WARNING: Log queue full, dropping Zigbee entry");
-      }
-    }
-  }
-
-  // Clear scan results to free memory
-  Zigbee.scanDelete();
-
-  consolePrintln("--- Zigbee Scan Complete ---\n");
 }
 
 void logToFile(String message) {
@@ -1750,13 +1721,11 @@ void updateDisplay(String statusMessage) {
     // This prevents display lag from mutex contention with scanning tasks
     int wifi_last = cached_wifi_last;
     int ble_last = cached_ble_last;
-    int zigbee_last = cached_zigbee_last;
     int wifi_total = cached_wifi_total;
     int ble_total = cached_ble_total;
-    int zigbee_total = cached_zigbee_total;
 
     // WiFi count: Last scan (Total) - add asterisk when scanning
-    display.setCursor(2, 18);
+    display.setCursor(2, 22);
     if (wifiScanning) {
       display.printf("W:%d(%d)*", wifi_last, wifi_total);
     } else {
@@ -1764,23 +1733,15 @@ void updateDisplay(String statusMessage) {
     }
 
     // BLE count: Last scan (Total) - add asterisk when scanning
-    display.setCursor(2, 28);
+    display.setCursor(2, 34);
     if (bleScanning) {
       display.printf("B:%d(%d)*", ble_last, ble_total);
     } else {
       display.printf("B:%d(%d)", ble_last, ble_total);
     }
 
-    // Zigbee count: Last scan (Total) - add asterisk when scanning
-    display.setCursor(2, 38);
-    if (zigbeeScanning) {
-      display.printf("Z:%d(%d)*", zigbee_last, zigbee_total);
-    } else {
-      display.printf("Z:%d(%d)", zigbee_last, zigbee_total);
-    }
-
     // Draw animated WiFi logo in center-right of screen
-    drawWiFiLogo(85, 18);
+    drawWiFiLogo(85, 22);
 
     // Advance animation state for next frame
     wifiAnimationState = (wifiAnimationState + 1) % 4;
