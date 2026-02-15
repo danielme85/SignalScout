@@ -1200,7 +1200,7 @@ void startScanTasks() {
       BaseType_t result = xTaskCreate(
         sdLogTask,           // Task function
         "SD Logger",         // Task name
-        3072,                // Stack size (bytes)
+        8192,                // Stack size (bytes)
         NULL,                // Parameters
         3,                   // Priority (0-24, higher = more priority)
         &sdLogTaskHandle     // Task handle
