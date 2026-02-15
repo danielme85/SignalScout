@@ -876,51 +876,257 @@ String formatFileSize(size_t size) {
   return String((float)size / (1024.0 * 1024.0), 1) + " MB";
 }
 
+// Files per page in web file browser
+#define FILES_PER_PAGE 20
+
 // Configure web server routes (called once before first server.begin())
 void configureServerRoutes() {
   if (serverRoutesConfigured) return;
 
-  // Root page - lists all files on SD card with download links
+  // Root page - lists files on SD card with pagination, stats, and delete buttons
+  // Uses chunked response to avoid building large strings in memory
   server.on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
-    String html = "<!DOCTYPE html><html><head><title>SignalScout Files</title>"
-                  "<style>"
-                  "body{font-family:sans-serif;margin:20px;background:#1a1a2e;color:#e0e0e0;}"
-                  "h1{color:#00d4ff;margin-bottom:20px;}"
-                  "a{color:#00d4ff;text-decoration:none;}"
-                  "a:hover{text-decoration:underline;}"
-                  ".file{padding:8px 0;border-bottom:1px solid #333;"
-                  "display:flex;justify-content:space-between;}"
-                  ".size{color:#888;font-size:0.85em;}"
-                  ".empty{color:#666;font-style:italic;}"
-                  "</style></head><body>"
-                  "<h1>SignalScout File Browser</h1>";
+    int page = 0;
+    if (request->hasParam("page")) {
+      page = request->getParam("page")->value().toInt();
+      if (page < 0) page = 0;
+    }
 
-    bool hasFiles = false;
+    // Check for status message from delete redirect
+    String statusMsg = "";
+    if (request->hasParam("msg")) {
+      statusMsg = request->getParam("msg")->value();
+    }
+
+    int skipCount = page * FILES_PER_PAGE;
+    int fileIndex = 0;
+    int filesShown = 0;
+    int totalFiles = 0;
+    size_t totalUsedBytes = 0;
+
+    // First pass: count total files and sum total size
+    if (xSemaphoreTake(sdCardMutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+      request->send(503, "text/plain", "SD card busy, try again");
+      return;
+    }
+
     File root = SD.open("/");
-    if (root) {
-      File file = root.openNextFile();
-      while (file) {
-        if (!file.isDirectory()) {
-          hasFiles = true;
-          String name = file.name();
-          size_t sz = file.size();
-          html += "<div class=\"file\">"
-                  "<a href=\"/download?name=" + name + "\">" + name + "</a>"
-                  "<span class=\"size\">" + formatFileSize(sz) + "</span>"
-                  "</div>";
-        }
-        file.close();
-        file = root.openNextFile();
+    if (!root) {
+      xSemaphoreGive(sdCardMutex);
+      request->send(500, "text/plain", "Failed to open SD card");
+      return;
+    }
+    File countFile = root.openNextFile();
+    while (countFile) {
+      if (!countFile.isDirectory()) {
+        totalFiles++;
+        totalUsedBytes += countFile.size();
       }
-      root.close();
+      countFile.close();
+      countFile = root.openNextFile();
+    }
+    root.close();
+
+    // Get SD card capacity info
+    uint64_t sdTotalBytes = SD.totalBytes();
+    uint64_t sdUsedBytes = SD.usedBytes();
+    xSemaphoreGive(sdCardMutex);
+
+    int totalPages = (totalFiles + FILES_PER_PAGE - 1) / FILES_PER_PAGE;
+    if (totalPages == 0) totalPages = 1;
+    if (page >= totalPages) page = totalPages - 1;
+
+    // Use chunked response to stream HTML without buffering the whole page
+    AsyncResponseStream *response = request->beginResponseStream("text/html");
+    response->print("<!DOCTYPE html><html><head><title>SignalScout Files</title>"
+                    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+                    "<style>"
+                    "body{font-family:sans-serif;margin:20px;background:#1a1a2e;color:#e0e0e0;}"
+                    "h1{color:#00d4ff;margin-bottom:5px;}"
+                    ".stats{background:#16213e;border:1px solid #333;border-radius:8px;"
+                    "padding:12px 16px;margin:12px 0;display:flex;gap:24px;flex-wrap:wrap;}"
+                    ".stat{display:flex;flex-direction:column;}"
+                    ".stat-val{color:#00d4ff;font-size:1.2em;font-weight:bold;}"
+                    ".stat-lbl{color:#888;font-size:0.75em;}"
+                    ".bar{background:#333;border-radius:4px;height:8px;width:120px;margin-top:4px;}"
+                    ".bar-fill{background:#00d4ff;border-radius:4px;height:100%;}"
+                    "a{color:#00d4ff;text-decoration:none;}"
+                    "a:hover{text-decoration:underline;}"
+                    ".file{padding:8px 0;border-bottom:1px solid #333;"
+                    "display:flex;align-items:center;gap:10px;}"
+                    ".fname{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;}"
+                    ".size{color:#888;font-size:0.85em;white-space:nowrap;}"
+                    ".del{color:#ff4444;background:none;border:1px solid #ff4444;"
+                    "border-radius:4px;padding:2px 8px;cursor:pointer;font-size:0.8em;white-space:nowrap;}"
+                    ".del:hover{background:#ff4444;color:#fff;}"
+                    ".empty{color:#666;font-style:italic;}"
+                    ".msg{padding:10px 14px;border-radius:6px;margin:10px 0;"
+                    "background:#1a3a1a;border:1px solid #2a5a2a;color:#6f6;}"
+                    ".msg-err{background:#3a1a1a;border-color:#5a2a2a;color:#f66;}"
+                    ".nav{margin-top:20px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;}"
+                    ".nav a,.nav span{padding:6px 14px;border:1px solid #444;border-radius:4px;}"
+                    ".nav .cur{background:#00d4ff;color:#1a1a2e;border-color:#00d4ff;}"
+                    ".delall{margin-top:20px;padding:10px 20px;background:none;"
+                    "border:1px solid #ff4444;color:#ff4444;border-radius:6px;"
+                    "cursor:pointer;font-size:0.9em;}"
+                    ".delall:hover{background:#ff4444;color:#fff;}"
+                    ".heap{color:#555;font-size:0.75em;margin-top:15px;}"
+                    "</style></head><body>"
+                    "<h1>SignalScout Files</h1>");
+
+    // Status message (e.g. after delete)
+    if (statusMsg.length() > 0) {
+      bool isErr = statusMsg.startsWith("Error");
+      response->print(isErr ? "<div class=\"msg msg-err\">" : "<div class=\"msg\">");
+      // Sanitize the message to prevent XSS
+      for (unsigned int i = 0; i < statusMsg.length() && i < 100; i++) {
+        char c = statusMsg.charAt(i);
+        if (c == '<') response->print("&lt;");
+        else if (c == '>') response->print("&gt;");
+        else if (c == '&') response->print("&amp;");
+        else if (c >= 32 && c <= 126) { char s[2] = {c, 0}; response->print(s); }
+      }
+      response->print("</div>");
     }
 
-    if (!hasFiles) {
-      html += "<p class=\"empty\">No files found on SD card.</p>";
+    // SD card stats
+    response->print("<div class=\"stats\">");
+
+    char statBuf[128];
+    snprintf(statBuf, sizeof(statBuf),
+             "<div class=\"stat\"><span class=\"stat-val\">%d</span>"
+             "<span class=\"stat-lbl\">Files</span></div>", totalFiles);
+    response->print(statBuf);
+
+    String usedStr = formatFileSize(totalUsedBytes);
+    snprintf(statBuf, sizeof(statBuf),
+             "<div class=\"stat\"><span class=\"stat-val\">%s</span>"
+             "<span class=\"stat-lbl\">Used by files</span></div>", usedStr.c_str());
+    response->print(statBuf);
+
+    if (sdTotalBytes > 0) {
+      String totalStr = formatFileSize((size_t)(sdTotalBytes));
+      String sdUsedStr = formatFileSize((size_t)(sdUsedBytes));
+      int usedPct = (int)((sdUsedBytes * 100ULL) / sdTotalBytes);
+      snprintf(statBuf, sizeof(statBuf),
+               "<div class=\"stat\"><span class=\"stat-val\">%s / %s</span>"
+               "<span class=\"stat-lbl\">SD card used (%d%%)</span>"
+               "<div class=\"bar\"><div class=\"bar-fill\" style=\"width:%d%%\"></div></div></div>",
+               sdUsedStr.c_str(), totalStr.c_str(), usedPct, usedPct);
+      response->print(statBuf);
     }
 
-    html += "</body></html>";
-    request->send(200, "text/html", html);
+    // Free heap
+    snprintf(statBuf, sizeof(statBuf),
+             "<div class=\"stat\"><span class=\"stat-val\">%u B</span>"
+             "<span class=\"stat-lbl\">Free heap</span></div>",
+             (unsigned int)ESP.getFreeHeap());
+    response->print(statBuf);
+
+    response->print("</div>");  // end stats
+
+    // File count and page info
+    char infoBuf[80];
+    snprintf(infoBuf, sizeof(infoBuf),
+             "<p style=\"color:#888;font-size:0.9em;\">Page %d of %d</p>",
+             page + 1, totalPages);
+    response->print(infoBuf);
+
+    if (totalFiles == 0) {
+      response->print("<p class=\"empty\">No files found on SD card.</p>");
+    } else {
+      // Second pass: output only the files for this page
+      if (xSemaphoreTake(sdCardMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+        File root2 = SD.open("/");
+        if (root2) {
+          File file = root2.openNextFile();
+          while (file) {
+            if (!file.isDirectory()) {
+              if (fileIndex >= skipCount && filesShown < FILES_PER_PAGE) {
+                // Stream one file row at a time using a fixed buffer
+                char rowBuf[512];
+                const char* fname = file.name();
+                String sizeStr = formatFileSize(file.size());
+                snprintf(rowBuf, sizeof(rowBuf),
+                         "<div class=\"file\">"
+                         "<span class=\"fname\"><a href=\"/download?name=%s\">%s</a></span>"
+                         "<span class=\"size\">%s</span>"
+                         "<button class=\"del\" onclick=\"delFile('%s')\">Delete</button>"
+                         "</div>",
+                         fname, fname, sizeStr.c_str(), fname);
+                response->print(rowBuf);
+                filesShown++;
+              } else if (fileIndex >= skipCount + FILES_PER_PAGE) {
+                file.close();
+                break;
+              }
+              fileIndex++;
+            }
+            file.close();
+            file = root2.openNextFile();
+          }
+          root2.close();
+        }
+        xSemaphoreGive(sdCardMutex);
+      }
+    }
+
+    // Pagination navigation
+    if (totalPages > 1) {
+      response->print("<div class=\"nav\">");
+      if (page > 0) {
+        char linkBuf[64];
+        snprintf(linkBuf, sizeof(linkBuf), "<a href=\"/?page=%d\">&laquo; Prev</a>", page - 1);
+        response->print(linkBuf);
+      }
+      int startPage = (page > 3) ? page - 3 : 0;
+      int endPage = startPage + 7;
+      if (endPage > totalPages) endPage = totalPages;
+      for (int p = startPage; p < endPage; p++) {
+        char pgBuf[64];
+        if (p == page) {
+          snprintf(pgBuf, sizeof(pgBuf), "<span class=\"cur\">%d</span>", p + 1);
+        } else {
+          snprintf(pgBuf, sizeof(pgBuf), "<a href=\"/?page=%d\">%d</a>", p, p + 1);
+        }
+        response->print(pgBuf);
+      }
+      if (page < totalPages - 1) {
+        char linkBuf[64];
+        snprintf(linkBuf, sizeof(linkBuf), "<a href=\"/?page=%d\">Next &raquo;</a>", page + 1);
+        response->print(linkBuf);
+      }
+      response->print("</div>");
+    }
+
+    // Delete all button (only show if there are files)
+    if (totalFiles > 0) {
+      char delAllBuf[128];
+      snprintf(delAllBuf, sizeof(delAllBuf),
+               "<button class=\"delall\" onclick=\"delAll(%d)\">Delete All Files (%d)</button>",
+               totalFiles, totalFiles);
+      response->print(delAllBuf);
+    }
+
+    // JavaScript for delete confirmation
+    response->print("<script>"
+                    "function delFile(n){"
+                    "if(confirm('Delete '+n+'?')){"
+                    "fetch('/delete?name='+encodeURIComponent(n),{method:'POST'})"
+                    ".then(r=>r.text()).then(t=>{"
+                    "window.location='/?msg='+encodeURIComponent(t);"
+                    "}).catch(e=>{alert('Error: '+e);});}}"
+                    "function delAll(cnt){"
+                    "if(confirm('Delete ALL '+cnt+' files? This cannot be undone.')){"
+                    "if(confirm('Are you really sure? All scan data will be lost.')){"
+                    "fetch('/delete-all',{method:'POST'})"
+                    ".then(r=>r.text()).then(t=>{"
+                    "window.location='/?msg='+encodeURIComponent(t);"
+                    "}).catch(e=>{alert('Error: '+e);});}}}"
+                    "</script>");
+
+    response->print("</body></html>");
+    request->send(response);
   });
 
   // File download - streams file directly from SD card
@@ -936,11 +1142,107 @@ void configureServerRoutes() {
       return;
     }
     String filepath = "/" + filename;
+    // Note: SD mutex not held here because ESPAsyncWebServer streams the file
+    // asynchronously over multiple TCP callbacks - holding a mutex across that
+    // would block other tasks for the entire transfer duration.
+    // In file sharing mode, scan tasks are suspended so there are no SD conflicts.
     if (SD.exists(filepath.c_str())) {
       request->send(SD, filepath, "application/octet-stream", true);
     } else {
       request->send(404, "text/plain", "File not found");
     }
+  });
+
+  // Delete a single file
+  server.on("/delete", HTTP_POST, [](AsyncWebServerRequest* request) {
+    if (!request->hasParam("name")) {
+      request->send(400, "text/plain", "Missing filename");
+      return;
+    }
+    String filename = request->getParam("name")->value();
+    if (filename.indexOf("..") >= 0) {
+      request->send(400, "text/plain", "Invalid filename");
+      return;
+    }
+    String filepath = "/" + filename;
+
+    if (xSemaphoreTake(sdCardMutex, pdMS_TO_TICKS(3000)) != pdTRUE) {
+      request->send(503, "text/plain", "Error: SD card busy");
+      return;
+    }
+    bool existed = SD.exists(filepath.c_str());
+    bool removed = false;
+    if (existed) {
+      removed = SD.remove(filepath.c_str());
+    }
+    xSemaphoreGive(sdCardMutex);
+
+    if (!existed) {
+      request->send(404, "text/plain", "Error: File not found");
+    } else if (removed) {
+      consolePrintf("Deleted file: %s\n", filepath.c_str());
+      request->send(200, "text/plain", String("Deleted " + filename).c_str());
+    } else {
+      request->send(500, "text/plain", "Error: Failed to delete file");
+    }
+  });
+
+  // Delete all files
+  server.on("/delete-all", HTTP_POST, [](AsyncWebServerRequest* request) {
+    if (xSemaphoreTake(sdCardMutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+      request->send(503, "text/plain", "Error: SD card busy");
+      return;
+    }
+
+    int deleted = 0;
+    int failed = 0;
+    File root = SD.open("/");
+    if (root) {
+      // Collect filenames first (can't delete while iterating on some FS implementations)
+      // Use a fixed array to avoid heap fragmentation
+      const int MAX_BATCH = 50;
+      String names[MAX_BATCH];
+      int count = 0;
+
+      // Process in batches to limit memory usage
+      bool moreFiles = true;
+      while (moreFiles) {
+        count = 0;
+        root.rewindDirectory();
+        // Skip already-processed files by scanning past deleted ones
+        File file = root.openNextFile();
+        while (file && count < MAX_BATCH) {
+          if (!file.isDirectory()) {
+            names[count++] = String("/") + file.name();
+          }
+          file.close();
+          file = root.openNextFile();
+        }
+        if (file) file.close();
+        moreFiles = (count == MAX_BATCH);
+
+        // Delete this batch
+        for (int i = 0; i < count; i++) {
+          if (SD.remove(names[i].c_str())) {
+            deleted++;
+          } else {
+            failed++;
+          }
+        }
+        if (count == 0) break;
+      }
+      root.close();
+    }
+    xSemaphoreGive(sdCardMutex);
+
+    consolePrintf("Delete all: %d deleted, %d failed\n", deleted, failed);
+    char msg[64];
+    if (failed == 0) {
+      snprintf(msg, sizeof(msg), "Deleted %d file%s", deleted, deleted == 1 ? "" : "s");
+    } else {
+      snprintf(msg, sizeof(msg), "Deleted %d, %d failed", deleted, failed);
+    }
+    request->send(200, "text/plain", msg);
   });
 
   serverRoutesConfigured = true;
