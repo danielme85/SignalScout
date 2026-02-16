@@ -26,6 +26,8 @@
 #include <Adafruit_SSD1306.h>
 #include <ESP32Time.h>
 #include <Adafruit_NeoPixel.h>
+#include <esp_task_wdt.h>
+#include <driver/gpio.h>
 #include <stdarg.h>
 #include "secrets.h"
 // File sharing via WiFi (install ESPAsyncWebServer and AsyncTCP libraries)
@@ -183,7 +185,7 @@ bool serverRoutesConfigured = false;
 // WiFi logo animation state (0 = dot only, 1-3 = number of rings)
 int wifiAnimationState = 0;
 
-// Deep sleep button state tracking
+// Sleep button state tracking
 unsigned long buttonPressStart = 0;
 bool buttonPressed = false;
 
@@ -570,18 +572,6 @@ void setup() {
   pinMode(SHARE_BUTTON_PIN, INPUT_PULLUP);  // Active LOW with internal pullup
   consolePrintln("Share button initialized (GPIO23): 1s = mode toggle, 3s = sleep");
 
-  // If waking from deep sleep, wait for button release to avoid immediate re-trigger
-  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
-  if (wakeup_reason == ESP_SLEEP_WAKEUP_GPIO || wakeup_reason == ESP_SLEEP_WAKEUP_EXT1) {
-    consolePrintln("Woke from deep sleep via GPIO - waiting for button release...");
-    while (digitalRead(SHARE_BUTTON_PIN) == LOW) {
-      delay(50);
-    }
-    consolePrintln("Button released, continuing boot");
-  } else if (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER) {
-    consolePrintln("Woke from deep sleep via timer (periodic wakeup)");
-  }
-
   // ============================================
   // CRITICAL: Initialize SD card FIRST before any radio initialization
   // The BLE radio can interfere with SPI if initialized first
@@ -701,20 +691,19 @@ void setup() {
   consolePrintln("Skipping BLE init (will initialize when scan task starts)");
   consolePrintln("\n[7/7] Skipped - BLE deferred to scan task");
 
-  // Configure deep sleep wakeup source (GPIO wakeup - share button)
-  // For ESP32-C5, use the deep sleep GPIO wakeup (available on newer ESP32 variants)
-  // Note: GPIO must support deep sleep wakeup (RTC domain GPIO)
-  uint64_t wakeup_pin_mask = 1ULL << SHARE_BUTTON_PIN;
-  esp_err_t wakeup_result = esp_deep_sleep_enable_gpio_wakeup(wakeup_pin_mask, ESP_GPIO_WAKEUP_GPIO_LOW);
-  if (wakeup_result == ESP_OK) {
-    consolePrintln("Deep sleep GPIO wakeup configured (press button to wake)");
-  } else {
-    consolePrintf("WARNING: GPIO%d may not support deep sleep wakeup (error: %d)\n", SHARE_BUTTON_PIN, wakeup_result);
-    consolePrintln("You may need to reset/power cycle to wake from deep sleep");
-    // Fallback: enable timer wakeup as backup (wake every 60 seconds to check button)
-    esp_sleep_enable_timer_wakeup(60 * 1000000ULL); // 60 seconds
-    consolePrintln("Timer wakeup enabled as fallback (60s intervals)");
-  }
+  // Configure light sleep wakeup source (GPIO wakeup - any GPIO works, unlike deep sleep)
+  gpio_wakeup_enable((gpio_num_t)SHARE_BUTTON_PIN, GPIO_INTR_LOW_LEVEL);
+  esp_sleep_enable_gpio_wakeup();
+  consolePrintln("Light sleep GPIO wakeup configured on GPIO23");
+
+  // Reconfigure task watchdog with longer timeout to prevent async_tcp triggers
+  esp_task_wdt_config_t wdt_config = {
+    .timeout_ms = 30000,
+    .idle_core_mask = 0,
+    .trigger_panic = false
+  };
+  esp_task_wdt_reconfigure(&wdt_config);
+  consolePrintln("Task watchdog reconfigured (30s timeout, no panic)");
 
   // Setup complete - default to scan mode; GPS wait runs non-blocking in loop()
   consolePrintln("\n=== INITIALIZATION COMPLETE ===");
@@ -798,7 +787,7 @@ void loop() {
 
   // Multi-function button (SHARE_BUTTON_PIN on GPIO23)
   // Hold and release between 1-3s: toggle between file sharing mode and scan mode
-  // Hold 3s (while still held): enter deep sleep
+  // Hold 3s (while still held): enter light sleep
   bool shareButtonState = (digitalRead(SHARE_BUTTON_PIN) == LOW);
 
   if (shareButtonState && !buttonPressed) {
@@ -812,8 +801,8 @@ void loop() {
       if (scanMode) {
         exitScanMode();
       }
-      enterDeepSleep();
-      // enterDeepSleep() does not return - device reboots on wake
+      enterLightSleep();
+      // After light sleep, execution resumes here
     }
   } else if (!shareButtonState && buttonPressed) {
     // Button released - check if held long enough for mode toggle
@@ -833,9 +822,9 @@ void loop() {
   delay(10);
 }
 
-void enterDeepSleep() {
-  consolePrintln("\n=== ENTERING DEEP SLEEP ===");
-  consolePrintln("Press button to wake up (device will reboot)");
+void enterLightSleep() {
+  consolePrintln("\n=== ENTERING LIGHT SLEEP ===");
+  consolePrintln("Press button to wake up");
 
   // Show "Going to sleep" message on display
   if (ENABLE_DISPLAY_OUTPUT) {
@@ -853,9 +842,9 @@ void enterDeepSleep() {
     display.display();
   }
 
-  // Log to SD card before sleep (flush queue first)
+  // Log to SD card before sleep
   if (ENABLE_LOG_OUTPUT && logFileReady) {
-    logToFile("Entering deep sleep mode");
+    logToFile("Entering light sleep mode");
   }
 
   // Turn off status LED
@@ -864,9 +853,20 @@ void enterDeepSleep() {
   // Flush serial output
   Serial.flush();
 
-  // Enter deep sleep (wakes on button press - GPIO wakeup configured in setup)
-  // esp_deep_sleep_start() does not return - device reboots when woken
-  esp_deep_sleep_start();
+  // Enter light sleep (wakes on button press - GPIO wakeup configured in setup)
+  // Execution resumes from this point after wakeup
+  esp_light_sleep_start();
+
+  // Woke up - wait for button release to avoid immediate re-trigger
+  consolePrintln("\n=== WOKE FROM LIGHT SLEEP ===");
+  while (digitalRead(SHARE_BUTTON_PIN) == LOW) {
+    delay(50);
+  }
+  buttonPressed = false;
+
+  if (ENABLE_LOG_OUTPUT && logFileReady) {
+    logToFile("Woke from light sleep");
+  }
 }
 
 // Format file size for display in file browser
@@ -941,36 +941,45 @@ void configureServerRoutes() {
     response->print("<!DOCTYPE html><html><head><title>SignalScout Files</title>"
                     "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
                     "<style>"
-                    "body{font-family:sans-serif;margin:20px;background:#1a1a2e;color:#e0e0e0;}"
-                    "h1{color:#00d4ff;margin-bottom:5px;}"
+                    "*{box-sizing:border-box;}"
+                    "html,body{height:100%;margin:0;padding:0;}"
+                    "body{font-family:sans-serif;background:#1a1a2e;color:#e0e0e0;"
+                    "display:flex;flex-direction:column;min-height:100vh;padding:16px 20px;}"
+                    "h1{color:#00d4ff;margin:0 0 8px 0;font-size:1.4em;}"
                     ".stats{background:#16213e;border:1px solid #333;border-radius:8px;"
-                    "padding:12px 16px;margin:12px 0;display:flex;gap:24px;flex-wrap:wrap;}"
+                    "padding:10px 14px;margin:0 0 10px 0;display:flex;gap:20px;flex-wrap:wrap;}"
                     ".stat{display:flex;flex-direction:column;}"
-                    ".stat-val{color:#00d4ff;font-size:1.2em;font-weight:bold;}"
-                    ".stat-lbl{color:#888;font-size:0.75em;}"
-                    ".bar{background:#333;border-radius:4px;height:8px;width:120px;margin-top:4px;}"
+                    ".stat-val{color:#00d4ff;font-size:1.1em;font-weight:bold;}"
+                    ".stat-lbl{color:#888;font-size:0.7em;}"
+                    ".bar{background:#333;border-radius:4px;height:6px;width:100px;margin-top:3px;}"
                     ".bar-fill{background:#00d4ff;border-radius:4px;height:100%;}"
                     "a{color:#00d4ff;text-decoration:none;}"
                     "a:hover{text-decoration:underline;}"
-                    ".file{padding:8px 0;border-bottom:1px solid #333;"
-                    "display:flex;align-items:center;gap:10px;}"
-                    ".fname{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;}"
-                    ".size{color:#888;font-size:0.85em;white-space:nowrap;}"
+                    ".tbl-wrap{flex:1;overflow-y:auto;margin:0 0 10px 0;}"
+                    "table{width:100%;border-collapse:collapse;}"
+                    "th{position:sticky;top:0;background:#16213e;color:#888;font-size:0.75em;"
+                    "text-transform:uppercase;letter-spacing:0.5px;text-align:left;"
+                    "padding:8px 10px;border-bottom:2px solid #00d4ff;}"
+                    "td{padding:7px 10px;border-bottom:1px solid #2a2a3e;}"
+                    "tr:hover{background:#16213e;}"
+                    ".sz{color:#888;white-space:nowrap;}"
+                    ".dt{color:#888;white-space:nowrap;font-size:0.85em;}"
                     ".del{color:#ff4444;background:none;border:1px solid #ff4444;"
                     "border-radius:4px;padding:2px 8px;cursor:pointer;font-size:0.8em;white-space:nowrap;}"
                     ".del:hover{background:#ff4444;color:#fff;}"
                     ".empty{color:#666;font-style:italic;}"
-                    ".msg{padding:10px 14px;border-radius:6px;margin:10px 0;"
+                    ".msg{padding:10px 14px;border-radius:6px;margin:0 0 10px 0;"
                     "background:#1a3a1a;border:1px solid #2a5a2a;color:#6f6;}"
                     ".msg-err{background:#3a1a1a;border-color:#5a2a2a;color:#f66;}"
-                    ".nav{margin-top:20px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;}"
-                    ".nav a,.nav span{padding:6px 14px;border:1px solid #444;border-radius:4px;}"
+                    ".nav{display:flex;gap:8px;align-items:center;flex-wrap:wrap;}"
+                    ".nav a,.nav span{padding:5px 12px;border:1px solid #444;border-radius:4px;font-size:0.9em;}"
                     ".nav .cur{background:#00d4ff;color:#1a1a2e;border-color:#00d4ff;}"
-                    ".delall{margin-top:20px;padding:10px 20px;background:none;"
+                    ".foot{margin-top:auto;padding-top:10px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;}"
+                    ".delall{padding:8px 16px;background:none;"
                     "border:1px solid #ff4444;color:#ff4444;border-radius:6px;"
-                    "cursor:pointer;font-size:0.9em;}"
+                    "cursor:pointer;font-size:0.85em;}"
                     ".delall:hover{background:#ff4444;color:#fff;}"
-                    ".heap{color:#555;font-size:0.75em;margin-top:15px;}"
+                    ".heap{color:#555;font-size:0.7em;}"
                     "</style></head><body>"
                     "<h1>SignalScout Files</h1>");
 
@@ -1025,16 +1034,12 @@ void configureServerRoutes() {
 
     response->print("</div>");  // end stats
 
-    // File count and page info
-    char infoBuf[80];
-    snprintf(infoBuf, sizeof(infoBuf),
-             "<p style=\"color:#888;font-size:0.9em;\">Page %d of %d</p>",
-             page + 1, totalPages);
-    response->print(infoBuf);
-
     if (totalFiles == 0) {
       response->print("<p class=\"empty\">No files found on SD card.</p>");
     } else {
+      response->print("<div class=\"tbl-wrap\"><table>"
+                      "<thead><tr><th>Name</th><th>Date</th><th>Size</th><th></th></tr></thead>"
+                      "<tbody>");
       // Second pass: output only the files for this page
       if (xSemaphoreTake(sdCardMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
         File root2 = SD.open("/");
@@ -1043,17 +1048,26 @@ void configureServerRoutes() {
           while (file) {
             if (!file.isDirectory()) {
               if (fileIndex >= skipCount && filesShown < FILES_PER_PAGE) {
-                // Stream one file row at a time using a fixed buffer
                 char rowBuf[512];
                 const char* fname = file.name();
                 String sizeStr = formatFileSize(file.size());
+                // Get last write time
+                time_t t = file.getLastWrite();
+                char dateBuf[20] = "-";
+                if (t > 0) {
+                  struct tm *tm = localtime(&t);
+                  if (tm) {
+                    snprintf(dateBuf, sizeof(dateBuf), "%04d-%02d-%02d %02d:%02d",
+                             tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
+                             tm->tm_hour, tm->tm_min);
+                  }
+                }
                 snprintf(rowBuf, sizeof(rowBuf),
-                         "<div class=\"file\">"
-                         "<span class=\"fname\"><a href=\"/download?name=%s\">%s</a></span>"
-                         "<span class=\"size\">%s</span>"
-                         "<button class=\"del\" onclick=\"delFile('%s')\">Delete</button>"
-                         "</div>",
-                         fname, fname, sizeStr.c_str(), fname);
+                         "<tr><td><a href=\"/download?name=%s\">%s</a></td>"
+                         "<td class=\"dt\">%s</td>"
+                         "<td class=\"sz\">%s</td>"
+                         "<td><button class=\"del\" onclick=\"delFile('%s')\">Delete</button></td></tr>",
+                         fname, fname, dateBuf, sizeStr.c_str(), fname);
                 response->print(rowBuf);
                 filesShown++;
               } else if (fileIndex >= skipCount + FILES_PER_PAGE) {
@@ -1069,6 +1083,21 @@ void configureServerRoutes() {
         }
         xSemaphoreGive(sdCardMutex);
       }
+      response->print("</tbody></table></div>");
+    }
+
+    // Footer: delete all (left) + pagination (right), pinned to bottom
+    response->print("<div class=\"foot\">");
+
+    // Delete all button
+    if (totalFiles > 0) {
+      char delAllBuf[128];
+      snprintf(delAllBuf, sizeof(delAllBuf),
+               "<button class=\"delall\" onclick=\"delAll(%d)\">Delete All (%d)</button>",
+               totalFiles, totalFiles);
+      response->print(delAllBuf);
+    } else {
+      response->print("<div></div>");  // spacer
     }
 
     // Pagination navigation
@@ -1099,14 +1128,7 @@ void configureServerRoutes() {
       response->print("</div>");
     }
 
-    // Delete all button (only show if there are files)
-    if (totalFiles > 0) {
-      char delAllBuf[128];
-      snprintf(delAllBuf, sizeof(delAllBuf),
-               "<button class=\"delall\" onclick=\"delAll(%d)\">Delete All Files (%d)</button>",
-               totalFiles, totalFiles);
-      response->print(delAllBuf);
-    }
+    response->print("</div>");  // end foot
 
     // JavaScript for delete confirmation
     response->print("<script>"
