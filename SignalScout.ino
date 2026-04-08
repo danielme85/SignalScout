@@ -400,13 +400,26 @@ void unifiedScanTask(void* parameter) {
     // ===== WIFI SCAN =====
     if (ENABLE_WIFI_SCAN) {
       consolePrintln("\n[1/2] Initializing WiFi radio...");
-      // Ensure WiFi is fully off before reinitializing (prevents driver state mismatch)
+      // Full radio reset - longer delay needed on ESP32-C5 after BLE releases the shared radio
       WiFi.mode(WIFI_OFF);
-      delay(200);
-      if (!WiFi.mode(WIFI_STA)) {
-        consolePrintln("WARNING: WiFi mode set failed, skipping WiFi scan this cycle");
+      delay(500);  // Was 200ms - increased for reliable radio release on ESP32-C5
+
+      // Retry WiFi mode set: after BLE deinit the radio driver sometimes needs a second attempt
+      bool wifiReady = false;
+      for (int attempt = 0; attempt < 3 && !wifiReady; attempt++) {
+        if (WiFi.mode(WIFI_STA)) {
+          wifiReady = true;
+        } else {
+          consolePrintf("WiFi mode set failed (attempt %d/3), retrying...\n", attempt + 1);
+          WiFi.mode(WIFI_OFF);
+          delay(300);
+        }
+      }
+
+      if (!wifiReady) {
+        consolePrintln("WARNING: WiFi radio init failed after 3 attempts, skipping WiFi scan this cycle");
       } else {
-        delay(300);
+        delay(500);  // Was 300ms - increased stabilization after mode change
         wifiScanning = true;
         scanWiFi();
         wifiScanning = false;
@@ -444,7 +457,7 @@ void unifiedScanTask(void* parameter) {
       consolePrintln("Releasing BLE radio...");
       BLEDevice::deinit(true);
       pBLEScan = NULL;
-      delay(500);
+      delay(1000);  // Was 500ms - ESP32-C5 needs more time to fully release radio before WiFi reclaims it
     }
 
     unsigned long cycleDuration = millis() - cycleStart;
@@ -1725,30 +1738,28 @@ void scanWiFi() {
     return;
   }
 
-  // Get number of APs found
-  uint16_t ap_count = 0;
-  esp_wifi_scan_get_ap_num(&ap_count);
+  // Static buffer avoids malloc/free every cycle, which causes heap fragmentation
+  // over long sessions and eventually causes malloc to fail (silently killing WiFi scans).
+  // 64 APs is plenty for mobile scanning; extras are silently truncated.
+  #define MAX_AP_RECORDS 64
+  static wifi_ap_record_t ap_records[MAX_AP_RECORDS];
+
+  // Pass buffer size as input; function fills it and writes actual count as output.
+  // This also frees the driver's internal AP list (unlike esp_wifi_scan_get_ap_num).
+  uint16_t ap_count = MAX_AP_RECORDS;
+  err = esp_wifi_scan_get_ap_records(&ap_count, ap_records);
+  if (err != ESP_OK) {
+    consolePrintf("Failed to get scan records: %d\n", err);
+    esp_wifi_clear_ap_list();  // Release driver's internal list to prevent memory leak
+    lastWiFiScanCount = 0;
+    return;
+  }
   lastWiFiScanCount = ap_count;
 
   consolePrintf("Networks found: %d\n", ap_count);
 
   if (ap_count == 0) {
     consolePrintln("No networks found");
-    return;
-  }
-
-  // Allocate memory for AP records
-  wifi_ap_record_t* ap_records = (wifi_ap_record_t*)malloc(sizeof(wifi_ap_record_t) * ap_count);
-  if (ap_records == NULL) {
-    consolePrintln("Failed to allocate memory for scan results");
-    return;
-  }
-
-  // Get AP records
-  err = esp_wifi_scan_get_ap_records(&ap_count, ap_records);
-  if (err != ESP_OK) {
-    consolePrintf("Failed to get scan records: %d\n", err);
-    free(ap_records);
     return;
   }
 
@@ -1849,9 +1860,6 @@ void scanWiFi() {
       }
     }
   }
-
-  // Free allocated memory
-  free(ap_records);
 
   consolePrintln("--- WiFi Scan Complete ---\n");
 }
