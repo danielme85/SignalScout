@@ -27,7 +27,6 @@
 #include <ESP32Time.h>
 #include <Adafruit_NeoPixel.h>
 #include <esp_task_wdt.h>
-#include <driver/gpio.h>
 #include <stdarg.h>
 #include "secrets.h"
 // File sharing via WiFi (install ESPAsyncWebServer and AsyncTCP libraries)
@@ -57,10 +56,9 @@
 #define LED_PIN      27      // WS2812B data pin
 #define LED_COUNT    1       // Number of LEDs
 
-// Multi-function Button Pin (File Share / Deep Sleep)
-#define SHARE_BUTTON_PIN  23    // GPIO for file share / sleep button
-#define SHARE_HOLD_TIME   1000  // Hold for 1 second to toggle file sharing (ms)
-#define SLEEP_HOLD_TIME   3000  // Hold for 3 seconds to enter deep sleep (ms)
+// Mode Button Pin (File Share toggle)
+#define SHARE_BUTTON_PIN  23    // GPIO for file share / scan mode toggle button
+#define SHARE_HOLD_TIME   1000  // Hold for 1 second to toggle mode (ms)
 
 // Battery ADC Pin
 #define BATTERY_PIN  6       // ADC pin for battery voltage
@@ -86,6 +84,13 @@
 #define ENABLE_CONSOLE_OUTPUT false   // Enable/disable serial console output
 #define ENABLE_DISPLAY_OUTPUT true   // Enable/disable OLED display output
 #define ENABLE_LOG_OUTPUT true       // Enable/disable SD card logging
+
+// GPS Debug mode - forces serial output of raw NMEA data and TinyGPSPlus stats
+// Helps diagnose whether GPS issue is wiring, baud rate, antenna, or software
+// Set to true to enable, upload, then open Serial Monitor at 115200 baud
+// Diagnostics: 0 chars = wiring/power issue; chars but no $GP = baud mismatch;
+//              $GP sentences but no fix = antenna/cold start; fix but stuck = SW bug
+#define GPS_DEBUG 0
 
 // Timing variables
 unsigned long lastScan = 0;
@@ -138,8 +143,14 @@ std::map<std::string, bool> seenWiFiDevices;    // Track unique WiFi devices by 
 std::map<std::string, bool> seenBLEDevices;     // Track unique BLE devices by address
 int uniqueWiFiCount = 0;
 int uniqueBLECount = 0;
+int uniqueFlockCount = 0;
 int lastWiFiScanCount = 0;    // Devices found in last scan
 int lastBLEScanCount = 0;     // Devices found in last scan
+volatile unsigned long flockLastSeenMs = 0;    // millis() when last Flock device was detected
+volatile unsigned long flockAlertUntilMs = 0;  // millis() until full-screen alert is shown
+
+// Cached Flock count for display
+int cached_flock_total = 0;
 
 // Memory protection: max entries per map before clearing (prevents heap exhaustion)
 // ~500 entries ≈ 25KB per map, total ~50KB for tracking
@@ -389,34 +400,38 @@ void unifiedScanTask(void* parameter) {
     // ===== WIFI SCAN =====
     if (ENABLE_WIFI_SCAN) {
       consolePrintln("\n[1/2] Initializing WiFi radio...");
-      WiFi.mode(WIFI_STA);
-      delay(300);  // Allow radio to initialize
-
-      wifiScanning = true;
-      scanWiFi();
-      wifiScanning = false;
-
-      // Turn off WiFi radio before next scan type
-      consolePrintln("Releasing WiFi radio...");
-      WiFi.disconnect(true);
+      // Ensure WiFi is fully off before reinitializing (prevents driver state mismatch)
       WiFi.mode(WIFI_OFF);
-      delay(500);  // Allow radio to fully release
+      delay(200);
+      if (!WiFi.mode(WIFI_STA)) {
+        consolePrintln("WARNING: WiFi mode set failed, skipping WiFi scan this cycle");
+      } else {
+        delay(300);
+        wifiScanning = true;
+        scanWiFi();
+        wifiScanning = false;
+
+        // Turn off WiFi radio before BLE
+        consolePrintln("Releasing WiFi radio...");
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+        delay(500);
+      }
     }
 
     // ===== BLE SCAN =====
     if (ENABLE_BLE_SCAN) {
       consolePrintln("\n[2/2] Initializing BLE radio...");
 
-      // Ensure clean state
       if (BLEDevice::getInitialized()) {
-        BLEDevice::deinit(true);
+        BLEDevice::deinit(true);  // Full release so WiFi gets its memory back next cycle
         delay(300);
       }
 
       BLEDevice::init("SignalScout");
       delay(200);
       pBLEScan = BLEDevice::getScan();
-      pBLEScan->setAdvertisedDeviceCallbacks(&bleCallbacks, false);  // Use static instance, don't take ownership
+      pBLEScan->setAdvertisedDeviceCallbacks(&bleCallbacks, false);
       pBLEScan->setActiveScan(true);
       pBLEScan->setInterval(100);
       pBLEScan->setWindow(99);
@@ -425,22 +440,27 @@ void unifiedScanTask(void* parameter) {
       scanBluetooth();
       bleScanning = false;
 
-      // Deinitialize BLE before next scan type
+      // Full deinit so WiFi scan next cycle has maximum heap available
       consolePrintln("Releasing BLE radio...");
       BLEDevice::deinit(true);
       pBLEScan = NULL;
-      delay(500);  // Allow radio to fully release
+      delay(500);
     }
 
     unsigned long cycleDuration = millis() - cycleStart;
 
     // Memory monitoring: warn if heap is getting low
     size_t freeHeap = ESP.getFreeHeap();
+    UBaseType_t scanStackWatermark = uxTaskGetStackHighWaterMark(NULL);
     if (freeHeap < 30000) {
       consolePrintf("WARNING: Low memory! Free heap: %u bytes\n", freeHeap);
     }
+    if (scanStackWatermark < 1024) {
+      consolePrintf("WARNING: Scan task stack nearly full! Watermark: %u bytes\n", scanStackWatermark * 4);
+    }
 
-    consolePrintf("========== SCAN CYCLE COMPLETE (%lu ms, heap: %u) ==========\n", cycleDuration, freeHeap);
+    consolePrintf("========== SCAN CYCLE COMPLETE (%lu ms, heap: %u, stack_wm: %u) ==========\n",
+                  cycleDuration, freeHeap, scanStackWatermark * 4);
 
     // Wait before next scan cycle (account for time already spent scanning)
     unsigned long waitTime = (SCAN_INTERVAL * 1000) > cycleDuration ?
@@ -568,9 +588,9 @@ void setup() {
   }
   consolePrintln("FreeRTOS mutexes and queue created successfully");
 
-  // Initialize multi-function button for file sharing and deep sleep
+  // Initialize mode button
   pinMode(SHARE_BUTTON_PIN, INPUT_PULLUP);  // Active LOW with internal pullup
-  consolePrintln("Share button initialized (GPIO23): 1s = mode toggle, 3s = sleep");
+  consolePrintln("Mode button initialized (GPIO23): hold 1s to toggle scan/file-share mode");
 
   // ============================================
   // CRITICAL: Initialize SD card FIRST before any radio initialization
@@ -691,11 +711,6 @@ void setup() {
   consolePrintln("Skipping BLE init (will initialize when scan task starts)");
   consolePrintln("\n[7/7] Skipped - BLE deferred to scan task");
 
-  // Configure light sleep wakeup source (GPIO wakeup - any GPIO works, unlike deep sleep)
-  gpio_wakeup_enable((gpio_num_t)SHARE_BUTTON_PIN, GPIO_INTR_LOW_LEVEL);
-  esp_sleep_enable_gpio_wakeup();
-  consolePrintln("Light sleep GPIO wakeup configured on GPIO23");
-
   // Reconfigure task watchdog with longer timeout to prevent async_tcp triggers
   esp_task_wdt_config_t wdt_config = {
     .timeout_ms = 30000,
@@ -715,7 +730,7 @@ void setup() {
 }
 
 void loop() {
-  // Main loop handles GPS reading, battery monitoring, display updates, and light sleep
+  // Main loop handles GPS reading, battery monitoring, display updates, and button handling
   // All scanning is handled by FreeRTOS tasks
 
   unsigned long currentTime = millis();
@@ -726,7 +741,34 @@ void loop() {
     char c = gpsSerial.read();
     gps.encode(c);
     gpsReadCount++;
+#if GPS_DEBUG
+    Serial.write(c);  // Echo raw NMEA to serial monitor
+#endif
   }
+
+#if GPS_DEBUG
+  // Print TinyGPSPlus stats every 5 seconds
+  static unsigned long lastGpsDebug = 0;
+  if (currentTime - lastGpsDebug >= 5000) {
+    lastGpsDebug = currentTime;
+    Serial.println(F("\n--- GPS Debug ---"));
+    Serial.print(F("Chars received: "));    Serial.println(gps.charsProcessed());
+    Serial.print(F("Sentences with fix: ")); Serial.println(gps.sentencesWithFix());
+    Serial.print(F("Failed checksum: "));   Serial.println(gps.failedChecksum());
+    Serial.print(F("Location valid: "));    Serial.println(gps.location.isValid() ? "YES" : "NO");
+    Serial.print(F("Time valid: "));        Serial.println(gps.time.isValid() ? "YES" : "NO");
+    Serial.print(F("Date valid: "));        Serial.println(gps.date.isValid() ? "YES" : "NO");
+    Serial.print(F("Satellites: "));        Serial.println(gps.satellites.isValid() ? String(gps.satellites.value()) : "N/A");
+    Serial.print(F("HDOP: "));              Serial.println(gps.hdop.isValid() ? String(gps.hdop.hdop(), 2) : "N/A");
+    if (gps.charsProcessed() < 10) {
+      Serial.println(F("!! NO DATA from GPS - check wiring and power"));
+    } else if (gps.sentencesWithFix() == 0 && gps.charsProcessed() > 100) {
+      Serial.println(F("!! Receiving data but no fix yet - check antenna sky view"));
+    }
+    Serial.println(F("-----------------"));
+    Serial.flush();
+  }
+#endif
 
   // Periodically update RTC from GPS (every ~60 seconds) to keep it accurate
   if (gps.time.isValid() && gps.date.isValid()) {
@@ -762,6 +804,7 @@ void loop() {
       cached_ble_last = lastBLEScanCount;
       cached_wifi_total = uniqueWiFiCount;
       cached_ble_total = uniqueBLECount;
+      cached_flock_total = uniqueFlockCount;
       xSemaphoreGive(deviceMapMutex);
       lastCountsCacheUpdate = currentTime;
     }
@@ -773,8 +816,9 @@ void loop() {
     lastBatteryRead = currentTime;
   }
 
-  // Update display periodically - GUARANTEED to run every second
-  if (ENABLE_DISPLAY_OUTPUT && currentTime - lastDisplayUpdate >= DISPLAY_UPDATE_INTERVAL) {
+  // Update display periodically - faster refresh during Flock alert for smooth blinking
+  unsigned long displayInterval = (flockAlertUntilMs > currentTime) ? 250 : DISPLAY_UPDATE_INTERVAL;
+  if (ENABLE_DISPLAY_OUTPUT && currentTime - lastDisplayUpdate >= displayInterval) {
     if (fileSharingMode) {
       updateDisplayFileSharing();
     } else if (scanMode && !scanTasksStarted) {
@@ -785,29 +829,18 @@ void loop() {
     lastDisplayUpdate = currentTime;
   }
 
-  // Multi-function button (SHARE_BUTTON_PIN on GPIO23)
-  // Hold and release between 1-3s: toggle between file sharing mode and scan mode
-  // Hold 3s (while still held): enter light sleep
+  // Mode button (SHARE_BUTTON_PIN on GPIO23)
+  // Hold and release for 1+ seconds: toggle between file sharing mode and scan mode
   bool shareButtonState = (digitalRead(SHARE_BUTTON_PIN) == LOW);
 
   if (shareButtonState && !buttonPressed) {
     // Button just pressed, start timing
     buttonPressed = true;
     buttonPressStart = currentTime;
-  } else if (shareButtonState && buttonPressed) {
-    // Button is being held, check for 3-second sleep threshold
-    unsigned long holdDuration = currentTime - buttonPressStart;
-    if (holdDuration >= SLEEP_HOLD_TIME) {
-      if (scanMode) {
-        exitScanMode();
-      }
-      enterLightSleep();
-      // After light sleep, execution resumes here
-    }
   } else if (!shareButtonState && buttonPressed) {
     // Button released - check if held long enough for mode toggle
     unsigned long holdDuration = currentTime - buttonPressStart;
-    if (holdDuration >= SHARE_HOLD_TIME && holdDuration < SLEEP_HOLD_TIME) {
+    if (holdDuration >= SHARE_HOLD_TIME) {
       // Toggle between scan mode and file sharing mode
       if (scanMode) {
         exitScanMode();
@@ -822,52 +855,6 @@ void loop() {
   delay(10);
 }
 
-void enterLightSleep() {
-  consolePrintln("\n=== ENTERING LIGHT SLEEP ===");
-  consolePrintln("Press button to wake up");
-
-  // Show "Going to sleep" message on display
-  if (ENABLE_DISPLAY_OUTPUT) {
-    display.clearDisplay();
-    display.setTextSize(2);
-    display.setCursor(10, 20);
-    display.println("Going to");
-    display.setCursor(10, 40);
-    display.println("sleep...");
-    display.display();
-    delay(2000);  // Show message for 2 seconds
-
-    // Clear display before sleep
-    display.clearDisplay();
-    display.display();
-  }
-
-  // Log to SD card before sleep
-  if (ENABLE_LOG_OUTPUT && logFileReady) {
-    logToFile("Entering light sleep mode");
-  }
-
-  // Turn off status LED
-  setLEDOff();
-
-  // Flush serial output
-  Serial.flush();
-
-  // Enter light sleep (wakes on button press - GPIO wakeup configured in setup)
-  // Execution resumes from this point after wakeup
-  esp_light_sleep_start();
-
-  // Woke up - wait for button release to avoid immediate re-trigger
-  consolePrintln("\n=== WOKE FROM LIGHT SLEEP ===");
-  while (digitalRead(SHARE_BUTTON_PIN) == LOW) {
-    delay(50);
-  }
-  buttonPressed = false;
-
-  if (ENABLE_LOG_OUTPUT && logFileReady) {
-    logToFile("Woke from light sleep");
-  }
-}
 
 // Format file size for display in file browser
 String formatFileSize(size_t size) {
@@ -1151,7 +1138,9 @@ void configureServerRoutes() {
     request->send(response);
   });
 
-  // File download - streams file directly from SD card
+  // File download - streams file from SD card using per-chunk open/seek/close
+  // This avoids holding an SD file handle across async TCP callbacks, which crashes
+  // on ESP32 with large files (AsyncFileResponse is not safe for FreeRTOS multi-task).
   server.on("/download", HTTP_GET, [](AsyncWebServerRequest* request) {
     if (!request->hasParam("name")) {
       request->send(400, "text/plain", "Missing filename");
@@ -1159,20 +1148,48 @@ void configureServerRoutes() {
     }
     String filename = request->getParam("name")->value();
     // Block path traversal attempts
-    if (filename.indexOf("..") >= 0) {
+    if (filename.indexOf("..") >= 0 || filename.indexOf("/") >= 0) {
       request->send(400, "text/plain", "Invalid filename");
       return;
     }
     String filepath = "/" + filename;
-    // Note: SD mutex not held here because ESPAsyncWebServer streams the file
-    // asynchronously over multiple TCP callbacks - holding a mutex across that
-    // would block other tasks for the entire transfer duration.
-    // In file sharing mode, scan tasks are suspended so there are no SD conflicts.
-    if (SD.exists(filepath.c_str())) {
-      request->send(SD, filepath, "application/octet-stream", true);
-    } else {
-      request->send(404, "text/plain", "File not found");
+
+    // Get file size before starting the response
+    size_t fileSize = 0;
+    if (xSemaphoreTake(sdCardMutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+      File f = SD.open(filepath.c_str(), FILE_READ);
+      if (f) {
+        fileSize = f.size();
+        f.close();
+      }
+      xSemaphoreGive(sdCardMutex);
     }
+    if (fileSize == 0) {
+      request->send(404, "text/plain", "File not found or empty");
+      return;
+    }
+
+    // Stream with per-chunk mutex-protected reads: open, seek to index, read, close
+    // Avoids holding a File handle across async callbacks (causes crashes on large files)
+    String fp = filepath;
+    AsyncWebServerResponse *response = request->beginResponse(
+      "application/octet-stream", fileSize,
+      [fp](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
+        size_t bytesRead = 0;
+        if (xSemaphoreTake(sdCardMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+          File f = SD.open(fp.c_str(), FILE_READ);
+          if (f) {
+            f.seek(index);
+            bytesRead = f.read(buffer, maxLen);
+            f.close();
+          }
+          xSemaphoreGive(sdCardMutex);
+        }
+        return bytesRead;
+      }
+    );
+    response->addHeader("Content-Disposition", "attachment; filename=\"" + filename + "\"");
+    request->send(response);
   });
 
   // Delete a single file
@@ -1547,7 +1564,7 @@ void startScanTasks() {
       BaseType_t result = xTaskCreate(
         unifiedScanTask,       // Task function
         "Unified Scanner",     // Task name
-        8192,                  // Stack size (larger for all scan types)
+        20480,                 // Stack size - BLE library needs significant stack space
         NULL,                  // Parameters
         1,                     // Priority
         &unifiedScanTaskHandle // Task handle
@@ -1602,8 +1619,6 @@ void updateDisplayFileSharing() {
   display.println(fileSharingIP);
   display.setCursor(2, 38);
   display.println("Hold 1s: scan mode");
-  display.setCursor(2, 50);
-  display.println("Hold 3s: sleep");
   display.display();
 }
 
@@ -1624,8 +1639,6 @@ void updateDisplayGPSWait() {
   display.printf("Battery: %d%%", batteryPercent);
   display.setCursor(0, 40);
   display.println("Hold 1s: file share");
-  display.setCursor(0, 52);
-  display.println("Hold 3s: sleep");
   display.display();
 }
 
@@ -1642,6 +1655,46 @@ String getAuthModeString(wifi_auth_mode_t authMode) {
     case WIFI_AUTH_WPA2_WPA3_PSK: return "WPA2/WPA3-PSK";
     default: return "UNKNOWN";
   }
+}
+
+// --- Flock Safety Device Detection ---
+// Signatures sourced from github.com/MaxwellDPS/Flock-You-Android
+
+static bool startsWithCI(const char* str, const char* prefix) {
+  return strncasecmp(str, prefix, strlen(prefix)) == 0;
+}
+
+// Returns true if WiFi AP matches Flock Safety signatures (SSID or OUI)
+bool isFlockWiFi(const char* ssid, uint8_t* bssid) {
+  // SSID patterns (case-insensitive prefix match)
+  if (startsWithCI(ssid, "flock"))   return true;
+  if (startsWithCI(ssid, "fs-"))     return true;
+  if (startsWithCI(ssid, "fs_"))     return true;
+  if (startsWithCI(ssid, "falcon"))  return true;
+  if (startsWithCI(ssid, "sparrow")) return true;
+  if (startsWithCI(ssid, "condor"))  return true;
+  // Quectel LTE modem OUI (primary Flock modem manufacturer)
+  if (bssid[0]==0x50 && bssid[1]==0x29 && bssid[2]==0x4D) return true;
+  if (bssid[0]==0x86 && bssid[1]==0x25 && bssid[2]==0x19) return true;
+  // Telit LTE modem OUI (alternate Flock modem)
+  if (bssid[0]==0x00 && bssid[1]==0x14 && bssid[2]==0x2D) return true;
+  if (bssid[0]==0xD8 && bssid[1]==0xC7 && bssid[2]==0x71) return true;
+  return false;
+}
+
+// Returns true if BLE device matches Flock Safety signatures (name or Raven service UUID)
+bool isFlockBLE(const char* name, const char* serviceUUID) {
+  // BLE name patterns (case-insensitive prefix match)
+  if (startsWithCI(name, "flock"))  return true;
+  if (startsWithCI(name, "falcon")) return true;
+  if (startsWithCI(name, "raven"))  return true;  // Raven acoustic sensor (Flock/SoundThinking)
+  // Raven custom BLE service UUIDs
+  if (serviceUUID && strstr(serviceUUID, "00003100") != NULL) return true;  // GPS Location
+  if (serviceUUID && strstr(serviceUUID, "00003200") != NULL) return true;  // Power Management
+  if (serviceUUID && strstr(serviceUUID, "00003300") != NULL) return true;  // Network Status
+  if (serviceUUID && strstr(serviceUUID, "00003400") != NULL) return true;  // Upload Statistics
+  if (serviceUUID && strstr(serviceUUID, "00003500") != NULL) return true;  // Error/Diagnostics
+  return false;
 }
 
 void scanWiFi() {
@@ -1719,6 +1772,10 @@ void scanWiFi() {
              ap->bssid[0], ap->bssid[1], ap->bssid[2],
              ap->bssid[3], ap->bssid[4], ap->bssid[5]);
 
+    // Flock Safety detection
+    bool isFlock = isFlockWiFi(ssid.c_str(), ap->bssid);
+    if (isFlock) flockLastSeenMs = millis();
+
     // Track unique devices by BSSID (with mutex protection)
     if (xSemaphoreTake(deviceMapMutex, portMAX_DELAY) == pdTRUE) {
       // Memory protection: clear map if it grows too large
@@ -1730,6 +1787,10 @@ void scanWiFi() {
       if (seenWiFiDevices.find(bssidKey) == seenWiFiDevices.end()) {
         seenWiFiDevices[bssidKey] = true;
         uniqueWiFiCount++;
+        if (isFlock) {
+          uniqueFlockCount++;
+          flockAlertUntilMs = millis() + 3000;
+        }
       }
       xSemaphoreGive(deviceMapMutex);
     }
@@ -1773,7 +1834,7 @@ void scanWiFi() {
       memset(&entry, 0, sizeof(LogEntry));
 
       // Use safe copy functions with guaranteed null-termination
-      safeCopy(entry.type, sizeof(entry.type), "WIFI");
+      safeCopy(entry.type, sizeof(entry.type), isFlock ? "FLOCK-WIFI" : "WIFI");
       safeCopy(entry.fingerprint, sizeof(entry.fingerprint), fingerprintStr);
       safeCopy(entry.param1, sizeof(entry.param1), ssid);
       safeCopy(entry.param2, sizeof(entry.param2), bssidStr);
@@ -1799,6 +1860,11 @@ void scanBluetooth() {
   consolePrintln("\n--- Bluetooth Scan Starting ---");
 
   BLEScanResults* foundDevices = pBLEScan->start(BLE_SCAN_TIME, false);
+  if (foundDevices == NULL) {
+    consolePrintln("ERROR: BLE scan returned NULL results, skipping");
+    lastBLEScanCount = 0;
+    return;
+  }
   int deviceCount = foundDevices->getCount();
   lastBLEScanCount = deviceCount;  // Track last scan count
 
@@ -1811,6 +1877,25 @@ void scanBluetooth() {
     String name = device.haveName() ? device.getName().c_str() : "Unknown";
     int rssi = device.getRSSI();
 
+    // Get additional info (extracted before mutex so Flock detection has full data)
+    String manufData = "";
+    String serviceUUID = "";
+    if (device.haveManufacturerData()) {
+      String rawData = device.getManufacturerData();
+      char hexStr[65] = {0};
+      for (size_t i = 0; i < rawData.length() && i < 32; i++) {
+        snprintf(hexStr + (i * 2), 3, "%02X", (uint8_t)rawData[i]);
+      }
+      manufData = String(hexStr);
+    }
+    if (device.haveServiceUUID()) {
+      serviceUUID = device.getServiceUUID().toString().c_str();
+    }
+
+    // Flock Safety detection (full name + UUID check)
+    bool isFlock = isFlockBLE(name.c_str(), serviceUUID.c_str());
+    if (isFlock) flockLastSeenMs = millis();
+
     // Track unique devices by address (with mutex protection)
     if (xSemaphoreTake(deviceMapMutex, portMAX_DELAY) == pdTRUE) {
       // Memory protection: clear map if it grows too large
@@ -1822,24 +1907,12 @@ void scanBluetooth() {
       if (seenBLEDevices.find(addrKey) == seenBLEDevices.end()) {
         seenBLEDevices[addrKey] = true;
         uniqueBLECount++;
+        if (isFlock) {
+          uniqueFlockCount++;
+          flockAlertUntilMs = millis() + 3000;
+        }
       }
       xSemaphoreGive(deviceMapMutex);
-    }
-
-    // Get additional info
-    String manufData = "";
-    String serviceUUID = "";
-    if (device.haveManufacturerData()) {
-      // Get raw manufacturer data as hex string (sanitized)
-      String rawData = device.getManufacturerData();
-      char hexStr[65] = {0};  // Limit to 32 bytes (64 hex chars + null)
-      for (size_t i = 0; i < rawData.length() && i < 32; i++) {
-        snprintf(hexStr + (i * 2), 3, "%02X", (uint8_t)rawData[i]);
-      }
-      manufData = String(hexStr);
-    }
-    if (device.haveServiceUUID()) {
-      serviceUUID = device.getServiceUUID().toString().c_str();
     }
 
     // Generate fingerprint using BLE address only (stable hardware identifier)
@@ -1879,7 +1952,7 @@ void scanBluetooth() {
       memset(&entry, 0, sizeof(LogEntry));
 
       // Use safe copy functions with guaranteed null-termination
-      safeCopy(entry.type, sizeof(entry.type), "BLE");
+      safeCopy(entry.type, sizeof(entry.type), isFlock ? "FLOCK-BLE" : "BLE");
       safeCopy(entry.fingerprint, sizeof(entry.fingerprint), fingerprintStr);
       safeCopy(entry.param1, sizeof(entry.param1), name);
       safeCopy(entry.param2, sizeof(entry.param2), address);
@@ -2019,6 +2092,26 @@ void displayGPSInfo() {
 }
 
 void updateDisplay(String statusMessage) {
+  // Full-screen blinking alert when a new Flock device is first detected
+  if (millis() < flockAlertUntilMs) {
+    bool inverted = (millis() / 350) % 2;
+    display.clearDisplay();
+    if (inverted) {
+      display.fillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, SSD1306_WHITE);
+      display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+    } else {
+      display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
+    }
+    display.setTextSize(2);
+    display.setCursor(46, 14);   // "GET" centered
+    display.print("GET");
+    display.setCursor(4, 34);    // "FLOCKED!" centered
+    display.print("FLOCKED!");
+    display.setTextColor(SSD1306_WHITE);
+    display.display();
+    return;
+  }
+
   display.clearDisplay();
 
   // Top Left: Satellite Signal Strength Indicator
@@ -2062,6 +2155,14 @@ void updateDisplay(String statusMessage) {
       display.printf("B:%d(%d)*", ble_last, ble_total);
     } else {
       display.printf("B:%d(%d)", ble_last, ble_total);
+    }
+
+    // Flock Safety alert - inverted text at y=46 when any Flock device detected
+    if (cached_flock_total > 0) {
+      display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);  // Inverted: alert style
+      display.setCursor(2, 46);
+      display.printf("FLOCK:%d", cached_flock_total);
+      display.setTextColor(SSD1306_WHITE);  // Reset
     }
 
     // Draw animated WiFi logo in center-right of screen

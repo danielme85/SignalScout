@@ -28,7 +28,7 @@ Hardware requirements:
 - SSD1309 OLED display 128x64 connected via SPI
 - WS2812B RGB LED on GPIO27 (status indicator)
 - 3.7V LiPo battery (e.g., 3000mAh) with voltage divider on GPIO6 for monitoring
-- Mode control button on GPIO23 (toggle between modes, deep sleep control)
+- Mode control button on GPIO23 (toggle between scan and file sharing modes)
 
 ## Development Environment
 
@@ -140,15 +140,6 @@ The sketch is structured around four main components:
    - Displays battery icon with percentage on OLED
    - Battery level shown during GPS wait screen
 
-9. **Light Sleep Control** (`enterLightSleep()` function):
-   - BOOT button on GPIO28 controls light sleep mode
-   - Hold BOOT button for 3 seconds to enter light sleep (prevents accidental activation)
-   - Display shows "Going to sleep..." message before entering light sleep
-   - Device logs sleep event to SD card before sleeping
-   - Wake up by holding BOOT button for 1 second (GPIO wakeup on any GPIO pin)
-   - After waking, execution resumes from sleep point (no full restart required)
-   - RTC time persists across sleep cycles, providing immediate time availability
-   - Light sleep reduces power consumption significantly for battery-powered operation
 
 ## Configuration
 
@@ -187,9 +178,8 @@ Key settings defined at the top of the sketch:
   - Battery thresholds: 3.0V (empty) to 4.2V (full)
 
 - **Mode Control Button Pin**: GPIO23 (SHARE_BUTTON_PIN)
-  - Used for mode switching and deep sleep control (active LOW, internal pullup enabled)
+  - Used for mode switching (active LOW, internal pullup enabled)
   - Hold for 1 second: Toggle between file sharing mode and scan mode
-  - Hold for 3 seconds: Enter deep sleep mode
   - Device boots into scan mode by default (waits for GPS signal on first boot)
   - GPS signal is acquired on boot before scanning begins
 
@@ -328,15 +318,6 @@ The device has two primary operating modes:
    - Access files by opening `http://[IP_ADDRESS]` in a web browser
    - To exit: Hold mode button for 1 second to return to scan mode
 
-**Deep Sleep Mode (Battery Conservation):**
-- Hold mode button (GPIO23) for 3 seconds to enter deep sleep
-- Display shows "Going to sleep..." message before entering sleep mode
-- Device logs "Entering deep sleep mode" to SD card before sleeping
-- In deep sleep, power consumption is minimized (device essentially off)
-- To wake up, press the mode button (device will reboot)
-- After waking, device reboots and enters scan mode by default
-- RTC time persists across sleep cycles, ensuring accurate timestamps resume immediately
-- Useful for battery-powered operation when not in use
 
 **Log File Format:**
 
