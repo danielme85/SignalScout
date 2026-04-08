@@ -56,9 +56,9 @@
 #define LED_PIN      27      // WS2812B data pin
 #define LED_COUNT    1       // Number of LEDs
 
-// Mode Button Pin (File Share toggle)
-#define SHARE_BUTTON_PIN  23    // GPIO for file share / scan mode toggle button
-#define SHARE_HOLD_TIME   1000  // Hold for 1 second to toggle mode (ms)
+// Mode Button Pin
+#define SHARE_BUTTON_PIN  23    // GPIO for mode button (active LOW, internal pullup)
+#define SHARE_HOLD_TIME   1000  // Hold for 1 second to trigger action (ms)
 
 // Battery ADC Pin
 #define BATTERY_PIN  6       // ADC pin for battery voltage
@@ -183,10 +183,11 @@ int batteryPercent = 0;
 unsigned long lastBatteryRead = 0;
 #define BATTERY_READ_INTERVAL 5000  // Read battery every 5 seconds
 
-// File sharing mode
+// Operating mode flags
 bool fileSharingMode = false;
-bool scanMode = false;  // Track if we're in scan mode
-bool scanTasksStarted = false;  // Whether scan tasks have been created (persists across mode toggles)
+bool scanMode = false;
+bool scanTasksStarted = false;
+bool scanPaused = false;  // Scan paused for safe power-off (button hold in scan mode)
 unsigned long gpsWaitStart = 0; // When GPS wait began (for elapsed time display)
 int gpsWaitDotCount = 0;        // Dot animation counter for GPS wait console output
 String fileSharingIP;
@@ -603,7 +604,7 @@ void setup() {
 
   // Initialize mode button
   pinMode(SHARE_BUTTON_PIN, INPUT_PULLUP);  // Active LOW with internal pullup
-  consolePrintln("Mode button initialized (GPIO23): hold 1s to toggle scan/file-share mode");
+  consolePrintln("Mode button initialized (GPIO23)");
 
   // ============================================
   // CRITICAL: Initialize SD card FIRST before any radio initialization
@@ -733,13 +734,36 @@ void setup() {
   esp_task_wdt_reconfigure(&wdt_config);
   consolePrintln("Task watchdog reconfigured (30s timeout, no panic)");
 
-  // Setup complete - default to scan mode; GPS wait runs non-blocking in loop()
   consolePrintln("\n=== INITIALIZATION COMPLETE ===");
-  consolePrintln("Scan mode default - waiting for GPS (press button to switch to file sharing)...\n");
 
-  scanMode = true;
-  gpsWaitStart = millis();
-  ledWaitingGPS();  // Orange: waiting for GPS
+  // Boot-time mode selection: show a 2-second window for the user to hold the button.
+  // Holding at power-on (or immediately after) selects file sharing mode.
+  // Releasing or not pressing selects scan mode (default).
+  if (ENABLE_DISPLAY_OUTPUT) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(2, 0);
+    display.println("SignalScout");
+    display.setCursor(2, 16);
+    display.println("Hold btn: file share");
+    display.setCursor(2, 32);
+    display.println("Release:  scan mode");
+    display.display();
+  }
+  delay(2000);
+
+  if (digitalRead(SHARE_BUTTON_PIN) == LOW) {
+    consolePrintln("Button held at boot - entering FILE SHARING mode");
+    // Wait for button release so it doesn't accidentally trigger anything else
+    while (digitalRead(SHARE_BUTTON_PIN) == LOW) delay(50);
+    buttonPressed = false;
+    enterFileSharingMode();
+  } else {
+    consolePrintln("Entering SCAN mode (default) - waiting for GPS...\n");
+    scanMode = true;
+    gpsWaitStart = millis();
+    ledWaitingGPS();  // Orange: waiting for GPS
+  }
 }
 
 void loop() {
@@ -832,7 +856,9 @@ void loop() {
   // Update display periodically - faster refresh during Flock alert for smooth blinking
   unsigned long displayInterval = (flockAlertUntilMs > currentTime) ? 250 : DISPLAY_UPDATE_INTERVAL;
   if (ENABLE_DISPLAY_OUTPUT && currentTime - lastDisplayUpdate >= displayInterval) {
-    if (fileSharingMode) {
+    if (scanPaused) {
+      updateDisplayPaused();
+    } else if (fileSharingMode) {
       updateDisplayFileSharing();
     } else if (scanMode && !scanTasksStarted) {
       updateDisplayGPSWait();
@@ -843,22 +869,20 @@ void loop() {
   }
 
   // Mode button (SHARE_BUTTON_PIN on GPIO23)
-  // Hold and release for 1+ seconds: toggle between file sharing mode and scan mode
+  // In scan mode: hold 1s to pause (flush SD, safe to power off); hold again to resume.
+  // Mode is selected at boot - no mid-session switching.
   bool shareButtonState = (digitalRead(SHARE_BUTTON_PIN) == LOW);
 
   if (shareButtonState && !buttonPressed) {
-    // Button just pressed, start timing
     buttonPressed = true;
     buttonPressStart = currentTime;
   } else if (!shareButtonState && buttonPressed) {
-    // Button released - check if held long enough for mode toggle
     unsigned long holdDuration = currentTime - buttonPressStart;
-    if (holdDuration >= SHARE_HOLD_TIME) {
-      // Toggle between scan mode and file sharing mode
-      if (scanMode) {
-        exitScanMode();
+    if (holdDuration >= SHARE_HOLD_TIME && scanMode && scanTasksStarted) {
+      if (!scanPaused) {
+        pauseScanning();
       } else {
-        enterScanMode();
+        resumeScanning();
       }
     }
     buttonPressed = false;
@@ -868,6 +892,61 @@ void loop() {
   delay(10);
 }
 
+
+// Pause scanning for safe power-off: suspends scan task, drains log queue,
+// waits for the last SD write to finish, then suspends the SD task.
+void pauseScanning() {
+  consolePrintln("\n=== PAUSING SCAN - flushing SD card ===");
+
+  // Stop new scans immediately
+  if (unifiedScanTaskHandle != NULL) vTaskSuspend(unifiedScanTaskHandle);
+  wifiScanning = false;
+  bleScanning = false;
+
+  // Queue a final "paused" marker before draining (sdLogTask still running)
+  if (ENABLE_LOG_OUTPUT && logFileReady) {
+    logToFile("Scanning paused - safe to power off");
+  }
+
+  // Wait for queue to drain (sdLogTask processes any remaining entries)
+  unsigned long waitStart = millis();
+  while (uxQueueMessagesWaiting(logQueue) > 0 && millis() - waitStart < 10000) {
+    delay(100);
+  }
+  delay(300);  // Final settle time for last SD write to complete
+
+  // Now safe to suspend SD task
+  if (sdLogTaskHandle != NULL) vTaskSuspend(sdLogTaskHandle);
+
+  scanPaused = true;
+  setLEDOff();
+  consolePrintln("Scan paused - safe to power off. Hold button 1s to resume.");
+}
+
+void resumeScanning() {
+  consolePrintln("\n=== RESUMING SCAN ===");
+  if (sdLogTaskHandle != NULL) vTaskResume(sdLogTaskHandle);
+  if (unifiedScanTaskHandle != NULL) vTaskResume(unifiedScanTaskHandle);
+  if (ENABLE_LOG_OUTPUT && logFileReady) {
+    logToFile("Scanning resumed");
+  }
+  scanPaused = false;
+  consolePrintln("Scanning resumed.");
+}
+
+void updateDisplayPaused() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(2, 0);
+  display.println("SCAN PAUSED");
+  display.setCursor(2, 14);
+  display.println("SD card flushed");
+  display.setCursor(2, 28);
+  display.println("Safe to power off");
+  display.setCursor(2, 46);
+  display.println("Hold 1s to resume");
+  display.display();
+}
 
 // Format file size for display in file browser
 String formatFileSize(size_t size) {
@@ -1488,44 +1567,6 @@ void exitFileSharingMode() {
   consolePrintln("File sharing mode exited, WiFi radio released");
 }
 
-void enterScanMode() {
-  consolePrintln("\n=== ENTERING SCAN MODE ===");
-
-  // Exit file sharing mode if active
-  if (fileSharingMode) {
-    exitFileSharingMode();
-  }
-
-  scanMode = true;
-
-  if (scanTasksStarted) {
-    // Tasks already created previously (we're returning from file sharing) - resume them
-    consolePrintln("Resuming scan tasks...");
-    if (unifiedScanTaskHandle != NULL) vTaskResume(unifiedScanTaskHandle);
-    if (sdLogTaskHandle != NULL) vTaskResume(sdLogTaskHandle);
-    if (ENABLE_LOG_OUTPUT && logFileReady) {
-      logToFile("Entering scan mode");
-    }
-    setLEDOff();
-    consolePrintln("Scan mode active!\n");
-  } else if (gps.location.isValid() && gps.time.isValid()) {
-    // GPS already acquired (e.g. acquired while in file sharing) - start tasks now
-    consolePrintln("GPS already available, starting tasks immediately");
-    gpsTimeValid = true;
-    if (!rtcSyncedFromGPS) {
-      rtc.setTime(gps.time.second(), gps.time.minute(), gps.time.hour(),
-                  gps.date.day(), gps.date.month(), gps.date.year());
-      rtcSyncedFromGPS = true;
-      consolePrintln("RTC synced from GPS time!");
-    }
-    startScanTasks();
-  } else {
-    // GPS not yet acquired - loop() will poll and call startScanTasks() when ready
-    consolePrintln("Waiting for GPS signal (non-blocking)...");
-    gpsWaitStart = millis();
-    ledWaitingGPS();  // Orange: waiting for GPS
-  }
-}
 
 // Create log file and FreeRTOS scan/log tasks. Called once when GPS first locks.
 void startScanTasks() {
@@ -1601,25 +1642,6 @@ void startScanTasks() {
   consolePrintln("Scan tasks started!\n");
 }
 
-void exitScanMode() {
-  consolePrintln("\n=== EXITING SCAN MODE ===");
-
-  if (ENABLE_LOG_OUTPUT && logFileReady) {
-    logToFile("Exiting scan mode");
-  }
-
-  // Suspend scanning and logging tasks (only if they were started)
-  if (scanTasksStarted) {
-    if (unifiedScanTaskHandle != NULL) vTaskSuspend(unifiedScanTaskHandle);
-    if (sdLogTaskHandle != NULL) vTaskSuspend(sdLogTaskHandle);
-    consolePrintln("Scanning tasks suspended");
-  }
-
-  scanMode = false;
-
-  // Enter file sharing mode
-  enterFileSharingMode();
-}
 
 void updateDisplayFileSharing() {
   display.clearDisplay();
@@ -1631,7 +1653,9 @@ void updateDisplayFileSharing() {
   display.print("IP: ");
   display.println(fileSharingIP);
   display.setCursor(2, 38);
-  display.println("Hold 1s: scan mode");
+  display.println("Power off when done");
+  display.setCursor(2, 50);
+  display.println("Boot normally to scan");
   display.display();
 }
 
@@ -1650,8 +1674,6 @@ void updateDisplayGPSWait() {
   display.printf("Sats: %d  Time: %lus", sats, elapsed);
   display.setCursor(0, 24);
   display.printf("Battery: %d%%", batteryPercent);
-  display.setCursor(0, 40);
-  display.println("Hold 1s: file share");
   display.display();
 }
 

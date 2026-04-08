@@ -14,12 +14,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Real-time OLED display showing GPS status, satellite count, compass, time, and speed
 - Logs all scan results to SD card via SPI
 - Outputs scan data to serial monitor for debugging
+- Hold mode button 1s to pause scanning (flushes SD card, shows "safe to power off")
+- Hold button again 1s to resume scanning
 
-**File Sharing Mode (Activated via button):**
+**File Sharing Mode (Hold button at boot):**
+- Hold the mode button while powering on — a 2-second window at boot selects this mode
 - Connects to WiFi network and hosts web server on port 80
 - Browse and download scan files from SD card via web browser
-- No GPS required - starts immediately when entered
-- Low power consumption, ideal for data retrieval
+- No GPS required - starts immediately
+- Power off when done; boot normally (button released) to return to scan mode
 
 Hardware requirements:
 - ESP32-C5 board (16MB FLASH, 8MB PSRAM)
@@ -28,7 +31,7 @@ Hardware requirements:
 - SSD1309 OLED display 128x64 connected via SPI
 - WS2812B RGB LED on GPIO27 (status indicator)
 - 3.7V LiPo battery (e.g., 3000mAh) with voltage divider on GPIO6 for monitoring
-- Mode control button on GPIO23 (toggle between scan and file sharing modes)
+- Mode control button on GPIO23 (hold at boot for file share; hold during scan to pause/resume)
 
 ## Development Environment
 
@@ -178,9 +181,10 @@ Key settings defined at the top of the sketch:
   - Battery thresholds: 3.0V (empty) to 4.2V (full)
 
 - **Mode Control Button Pin**: GPIO23 (SHARE_BUTTON_PIN)
-  - Used for mode switching (active LOW, internal pullup enabled)
-  - Hold for 1 second: Toggle between file sharing mode and scan mode
-  - Device boots into scan mode by default (waits for GPS signal on first boot)
+  - Active LOW, internal pullup enabled
+  - **At boot**: hold button during power-on → file sharing mode (2-second window)
+  - **During scan**: hold 1 second → pause (flush SD, safe to power off); hold again → resume
+  - Device boots into scan mode by default (waits for GPS signal)
   - GPS signal is acquired on boot before scanning begins
 
 - **Display Update Interval**: 1000ms (1 second)
@@ -301,22 +305,22 @@ The display provides real-time visual feedback (updates every 1 second):
 The device has two primary operating modes:
 
 1. **Scan Mode (Default):**
-   - Device boots into scan mode by default
-   - Waits for GPS signal lock before starting (only on first entry to scan mode)
+   - Device boots into scan mode by default (button not held at power-on)
+   - Waits for GPS signal lock before starting scans
    - Starts WiFi and BLE scanning tasks
    - Logs all scan results to SD card with GPS timestamps
    - Display shows real-time GPS data, device counts, and scanning status
-   - To switch: Hold mode button for 1 second to enter file sharing mode
+   - **Pause for safe power-off**: Hold mode button 1 second → pauses scanning, drains log
+     queue, waits for last SD write, shows "Safe to power off". Hold again 1s to resume.
 
 2. **File Sharing Mode:**
-   - Activated by holding the mode button (GPIO23) for 1 second while in scan mode
+   - Selected at boot: hold the mode button while powering on (2-second window shown on display)
    - Connects to WiFi network specified in `secrets.h` (WIFI_SSID and WIFI_PASSWORD)
    - Hosts a web server on port 80 for browsing and downloading scan files
-   - No GPS signal required
-   - Scanning tasks are suspended to avoid SD card and radio conflicts
-   - Display shows IP address and mode instructions
+   - No GPS signal required — starts immediately
+   - Display shows IP address; power off when done
    - Access files by opening `http://[IP_ADDRESS]` in a web browser
-   - To exit: Hold mode button for 1 second to return to scan mode
+   - To return to scan mode: power off, boot normally (button not held)
 
 
 **Log File Format:**
