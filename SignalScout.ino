@@ -31,6 +31,7 @@
 #include "secrets.h"
 // File sharing via WiFi (install ESPAsyncWebServer and AsyncTCP libraries)
 #include <ESPAsyncWebServer.h>
+#include <Preferences.h>    // NVS key-value store for persisting settings
 
 // SD Card SPI Pins (adjust these based on your wiring)
 #define SD_CS    1  // Chip Select
@@ -76,9 +77,9 @@
 #define SCAN_INTERVAL 10  // WiFi and BLE scan every x seconds
 #define BLE_SCAN_TIME 3      // BLE scan duration in seconds
 
-// Scanner enable/disable flags
-#define ENABLE_WIFI_SCAN true    // Enable/disable WiFi scanning
-#define ENABLE_BLE_SCAN true     // Enable/disable Bluetooth scanning
+// Scanner enable/disable flags (runtime bools, persisted in NVS, changeable via pause menu)
+bool enableWifiScan = true;  // Enable/disable WiFi scanning
+bool enableBleScan  = true;  // Enable/disable BLE scanning
 
 // Output enable/disable flags
 #define ENABLE_CONSOLE_OUTPUT false   // Enable/disable serial console output
@@ -188,6 +189,8 @@ bool fileSharingMode = false;
 bool scanMode = false;
 bool scanTasksStarted = false;
 bool scanPaused = false;  // Scan paused for safe power-off (button hold in scan mode)
+int  pauseMenuCursor = 0; // 0=WiFi toggle, 1=BLE toggle, 2=Resume
+Preferences prefs;        // NVS key-value store for settings persistence
 unsigned long gpsWaitStart = 0; // When GPS wait began (for elapsed time display)
 int gpsWaitDotCount = 0;        // Dot animation counter for GPS wait console output
 String fileSharingIP;
@@ -307,6 +310,24 @@ void ledFileSharing() {
   setLEDColor(0, 100, 255);  // Blue: File sharing mode
 }
 
+// Load scanner settings from NVS (called once at boot)
+void loadSettings() {
+  prefs.begin("scout", true);  // true = read-only
+  enableWifiScan = prefs.getBool("wifi", true);
+  enableBleScan  = prefs.getBool("ble",  true);
+  prefs.end();
+  consolePrintf("Settings loaded: WiFi=%s, BLE=%s\n",
+                enableWifiScan ? "ON" : "OFF", enableBleScan ? "ON" : "OFF");
+}
+
+// Save scanner settings to NVS (called when user changes a toggle)
+void saveSettings() {
+  prefs.begin("scout", false);  // false = read-write
+  prefs.putBool("wifi", enableWifiScan);
+  prefs.putBool("ble",  enableBleScan);
+  prefs.end();
+}
+
 // Read battery voltage and calculate percentage
 int readBatteryPercent() {
   // Take multiple samples for stability
@@ -383,15 +404,17 @@ bool generateLogFileName() {
 }
 
 // FreeRTOS Task: Unified Scanner
-// Single unified scanning task - scans WiFi and BLE sequentially
-// ESP32-C5 has a shared 2.4GHz radio, so we must initialize/deinitialize
-// each radio type between scans to avoid conflicts
+// Scans WiFi then BLE sequentially. BLE is initialized once and kept alive across
+// cycles — the ESP32-C5 hardware coexistence arbiter handles radio sharing automatically.
+// Repeatedly calling BLEDevice::init()/deinit() every cycle corrupts radio state after
+// 3-5 cycles, which is what was causing WiFi to hang. Keeping BLE initialized avoids this.
 void unifiedScanTask(void* parameter) {
   consolePrintln("[Scan Task] Unified scanner started");
+  int wifiFailCount = 0;
 
   while (true) {
     if (!logFileReady) {
-      vTaskDelay(pdMS_TO_TICKS(1000));  // Wait for log file to be ready
+      vTaskDelay(pdMS_TO_TICKS(1000));
       continue;
     }
 
@@ -399,71 +422,97 @@ void unifiedScanTask(void* parameter) {
     unsigned long cycleStart = millis();
 
     // ===== WIFI SCAN =====
-    if (ENABLE_WIFI_SCAN) {
-      consolePrintln("\n[1/2] Initializing WiFi radio...");
-      // Full radio reset - longer delay needed on ESP32-C5 after BLE releases the shared radio
-      WiFi.mode(WIFI_OFF);
-      delay(500);  // Was 200ms - increased for reliable radio release on ESP32-C5
+    if (enableWifiScan) {
+      consolePrintln("\n[WiFi] Initializing radio...");
 
-      // Retry WiFi mode set: after BLE deinit the radio driver sometimes needs a second attempt
+      // Clear any leftover scan data from a previous cycle before changing mode
+      esp_wifi_clear_ap_list();
+      WiFi.disconnect(true);
+      WiFi.mode(WIFI_OFF);
+      delay(300);
+
       bool wifiReady = false;
       for (int attempt = 0; attempt < 3 && !wifiReady; attempt++) {
         if (WiFi.mode(WIFI_STA)) {
           wifiReady = true;
         } else {
-          consolePrintf("WiFi mode set failed (attempt %d/3), retrying...\n", attempt + 1);
+          consolePrintf("[WiFi] mode set failed (attempt %d/3), retrying...\n", attempt + 1);
           WiFi.mode(WIFI_OFF);
           delay(300);
         }
       }
 
       if (!wifiReady) {
-        consolePrintln("WARNING: WiFi radio init failed after 3 attempts, skipping WiFi scan this cycle");
+        consolePrintln("[WiFi] WARNING: Radio init failed after 3 attempts, skipping this cycle");
+        wifiFailCount++;
       } else {
-        delay(500);  // Was 300ms - increased stabilization after mode change
+        delay(300);
         wifiScanning = true;
-        scanWiFi();
+        bool scanOk = scanWiFi();
         wifiScanning = false;
 
-        // Turn off WiFi radio before BLE
-        consolePrintln("Releasing WiFi radio...");
+        if (scanOk) {
+          wifiFailCount = 0;
+        } else {
+          wifiFailCount++;
+          consolePrintf("[WiFi] Scan failed (consecutive failures: %d)\n", wifiFailCount);
+        }
+
+        consolePrintln("[WiFi] Releasing radio...");
         WiFi.disconnect(true);
         WiFi.mode(WIFI_OFF);
+        delay(300);
+      }
+
+      // Deep recovery after repeated failures: force full ESP-IDF WiFi driver reset
+      if (wifiFailCount >= 3) {
+        consolePrintln("[WiFi] Too many failures - deep radio reset...");
+        esp_wifi_stop();
         delay(500);
+        esp_wifi_start();
+        delay(500);
+        wifiFailCount = 0;
+        consolePrintln("[WiFi] Deep reset complete");
       }
     }
 
     // ===== BLE SCAN =====
-    if (ENABLE_BLE_SCAN) {
-      consolePrintln("\n[2/2] Initializing BLE radio...");
+    if (enableBleScan) {
+      consolePrintln("\n[BLE] Scanning...");
 
-      if (BLEDevice::getInitialized()) {
-        BLEDevice::deinit(true);  // Full release so WiFi gets its memory back next cycle
-        delay(300);
+      // Initialize BLE if not already done (first run, or re-enabled via settings)
+      if (!BLEDevice::getInitialized()) {
+        consolePrintln("[BLE] Initializing stack...");
+        BLEDevice::init("SignalScout");
+        delay(200);
+        pBLEScan = BLEDevice::getScan();
+        pBLEScan->setAdvertisedDeviceCallbacks(&bleCallbacks, false);
+        pBLEScan->setActiveScan(true);
+        pBLEScan->setInterval(100);
+        pBLEScan->setWindow(99);
+      } else if (pBLEScan == NULL) {
+        pBLEScan = BLEDevice::getScan();
+        pBLEScan->setAdvertisedDeviceCallbacks(&bleCallbacks, false);
+        pBLEScan->setActiveScan(true);
+        pBLEScan->setInterval(100);
+        pBLEScan->setWindow(99);
       }
-
-      BLEDevice::init("SignalScout");
-      delay(200);
-      pBLEScan = BLEDevice::getScan();
-      pBLEScan->setAdvertisedDeviceCallbacks(&bleCallbacks, false);
-      pBLEScan->setActiveScan(true);
-      pBLEScan->setInterval(100);
-      pBLEScan->setWindow(99);
 
       bleScanning = true;
       scanBluetooth();
       bleScanning = false;
-
-      // Full deinit so WiFi scan next cycle has maximum heap available
-      consolePrintln("Releasing BLE radio...");
+      pBLEScan->clearResults();
+      delay(200);
+    } else if (BLEDevice::getInitialized()) {
+      // User disabled BLE via settings - release the stack
+      consolePrintln("[BLE] Disabled - releasing stack...");
       BLEDevice::deinit(true);
       pBLEScan = NULL;
-      delay(1000);  // Was 500ms - ESP32-C5 needs more time to fully release radio before WiFi reclaims it
+      delay(300);
     }
 
     unsigned long cycleDuration = millis() - cycleStart;
 
-    // Memory monitoring: warn if heap is getting low
     size_t freeHeap = ESP.getFreeHeap();
     UBaseType_t scanStackWatermark = uxTaskGetStackHighWaterMark(NULL);
     if (freeHeap < 30000) {
@@ -476,7 +525,6 @@ void unifiedScanTask(void* parameter) {
     consolePrintf("========== SCAN CYCLE COMPLETE (%lu ms, heap: %u, stack_wm: %u) ==========\n",
                   cycleDuration, freeHeap, scanStackWatermark * 4);
 
-    // Wait before next scan cycle (account for time already spent scanning)
     unsigned long waitTime = (SCAN_INTERVAL * 1000) > cycleDuration ?
                              (SCAN_INTERVAL * 1000) - cycleDuration : 1000;
     consolePrintf("Next scan cycle in %lu ms\n", waitTime);
@@ -710,9 +758,13 @@ void setup() {
   gpsSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX, GPS_TX);
   consolePrintln("GPS UART initialized");
 
+  // Load persisted scan settings from NVS
+  consolePrintln("\n[5b/7] Loading saved settings...");
+  loadSettings();
+
   // Initialize WiFi
   consolePrintln("\n[6/7] Initializing WiFi...");
-  if (ENABLE_WIFI_SCAN) {
+  if (enableWifiScan) {
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
     delay(100);
@@ -878,11 +930,20 @@ void loop() {
     buttonPressStart = currentTime;
   } else if (!shareButtonState && buttonPressed) {
     unsigned long holdDuration = currentTime - buttonPressStart;
-    if (holdDuration >= SHARE_HOLD_TIME && scanMode && scanTasksStarted) {
+    if (scanMode && scanTasksStarted) {
       if (!scanPaused) {
-        pauseScanning();
+        // Normal operation: long press pauses and opens settings menu
+        if (holdDuration >= SHARE_HOLD_TIME) {
+          pauseMenuCursor = 0;  // Reset cursor to top of menu
+          pauseScanning();
+        }
       } else {
-        resumeScanning();
+        // Paused / settings menu: short tap advances cursor, long press activates
+        if (holdDuration < SHARE_HOLD_TIME) {
+          pauseMenuCursor = (pauseMenuCursor + 1) % 3;
+        } else {
+          activatePauseMenuItem();
+        }
       }
     }
     buttonPressed = false;
@@ -934,17 +995,67 @@ void resumeScanning() {
   consolePrintln("Scanning resumed.");
 }
 
+// Activate the currently highlighted pause menu item
+void activatePauseMenuItem() {
+  switch (pauseMenuCursor) {
+    case 0:  // Toggle WiFi
+      enableWifiScan = !enableWifiScan;
+      saveSettings();
+      consolePrintf("WiFi scanning %s\n", enableWifiScan ? "enabled" : "disabled");
+      break;
+    case 1:  // Toggle BLE
+      enableBleScan = !enableBleScan;
+      saveSettings();
+      consolePrintf("BLE scanning %s\n", enableBleScan ? "enabled" : "disabled");
+      break;
+    case 2:  // Resume
+      resumeScanning();
+      break;
+  }
+}
+
 void updateDisplayPaused() {
   display.clearDisplay();
   display.setTextSize(1);
+
+  // Title bar
   display.setCursor(2, 0);
-  display.println("SCAN PAUSED");
-  display.setCursor(2, 14);
-  display.println("SD card flushed");
-  display.setCursor(2, 28);
-  display.println("Safe to power off");
-  display.setCursor(2, 46);
-  display.println("Hold 1s to resume");
+  display.println("== PAUSED / SETTINGS ==");
+
+  // Menu item 0: WiFi toggle
+  display.setCursor(2, 13);
+  if (pauseMenuCursor == 0) {
+    display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);  // Inverted = selected
+    display.printf(" WiFi: %-3s ", enableWifiScan ? "ON" : "OFF");
+    display.setTextColor(SSD1306_WHITE);
+  } else {
+    display.printf("  WiFi: %-3s ", enableWifiScan ? "ON" : "OFF");
+  }
+
+  // Menu item 1: BLE toggle
+  display.setCursor(2, 25);
+  if (pauseMenuCursor == 1) {
+    display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+    display.printf(" BLE:  %-3s ", enableBleScan ? "ON" : "OFF");
+    display.setTextColor(SSD1306_WHITE);
+  } else {
+    display.printf("  BLE:  %-3s ", enableBleScan ? "ON" : "OFF");
+  }
+
+  // Menu item 2: Resume
+  display.setCursor(2, 37);
+  if (pauseMenuCursor == 2) {
+    display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+    display.print(" Resume Scan ");
+    display.setTextColor(SSD1306_WHITE);
+  } else {
+    display.print("  Resume Scan");
+  }
+
+  // Hint at bottom
+  display.setCursor(2, 54);
+  display.print("Tap=next  Hold=select");
+
   display.display();
 }
 
@@ -1390,7 +1501,7 @@ void enterFileSharingMode() {
   // Deinitialize BLE to free up 2.4GHz radio for WiFi (if it was initialized)
   // BLE and WiFi share radio resources on ESP32-C5
   // The unified scan task releases radios after each scan, but we double-check here
-  if (ENABLE_BLE_SCAN && BLEDevice::getInitialized()) {
+  if (enableBleScan && BLEDevice::getInitialized()) {
     consolePrintln("Deinitializing BLE to free radio for WiFi...");
     BLEDevice::deinit(true);  // true = release all BLE memory for clean radio handoff
     pBLEScan = NULL;          // Mark as deinitialized
@@ -1590,7 +1701,7 @@ void startScanTasks() {
   }
 
   // SD Logger Task (only create if SD card is mounted and logging enabled)
-  if (ENABLE_LOG_OUTPUT && sdCardMounted && logFileReady) {
+  if (ENABLE_LOG_OUTPUT && sdCardMounted && logFileReady) {  // ENABLE_LOG_OUTPUT is still a #define
     if (sdLogTaskHandle == NULL) {
       BaseType_t result = xTaskCreate(
         sdLogTask,           // Task function
@@ -1612,8 +1723,8 @@ void startScanTasks() {
   }
 
   // Unified Scan Task - handles WiFi and BLE sequentially
-  // This ensures only one radio type is active at a time on ESP32-C5's shared radio
-  if (ENABLE_WIFI_SCAN || ENABLE_BLE_SCAN) {
+  // Always create the task; it reads enableWifiScan/enableBleScan at runtime each cycle
+  if (true) {
     if (unifiedScanTaskHandle == NULL) {
       BaseType_t result = xTaskCreate(
         unifiedScanTask,       // Task function
@@ -1732,11 +1843,10 @@ bool isFlockBLE(const char* name, const char* serviceUUID) {
   return false;
 }
 
-void scanWiFi() {
+// Returns true on success, false if scan could not be started or records could not be read.
+bool scanWiFi() {
   consolePrintln("\n--- WiFi Scan Starting (2.4GHz + 5GHz) ---");
 
-  // Use ESP-IDF scan API directly to avoid WIFI_BAND_MODE_AUTO issues
-  // Scan time settings adjusted for ~3 second total scan time
   wifi_scan_config_t scan_config = {
     .ssid = NULL,
     .bssid = NULL,
@@ -1745,19 +1855,19 @@ void scanWiFi() {
     .scan_type = WIFI_SCAN_TYPE_ACTIVE,
     .scan_time = {
       .active = {
-        .min = 120,  // Minimum scan time per channel (ms)
-        .max = 150   // Maximum scan time per channel (ms) - increased for ~3s total
+        .min = 120,
+        .max = 150
       },
-      .passive = 400  // Passive scan time per channel (ms)
+      .passive = 400
     }
   };
 
   // Start scan (blocking mode)
   esp_err_t err = esp_wifi_scan_start(&scan_config, true);
   if (err != ESP_OK) {
-    consolePrintf("WiFi scan failed to start: %d\n", err);
+    consolePrintf("[WiFi] scan_start failed: %d\n", err);
     lastWiFiScanCount = 0;
-    return;
+    return false;
   }
 
   // Static buffer avoids malloc/free every cycle, which causes heap fragmentation
@@ -1771,10 +1881,10 @@ void scanWiFi() {
   uint16_t ap_count = MAX_AP_RECORDS;
   err = esp_wifi_scan_get_ap_records(&ap_count, ap_records);
   if (err != ESP_OK) {
-    consolePrintf("Failed to get scan records: %d\n", err);
-    esp_wifi_clear_ap_list();  // Release driver's internal list to prevent memory leak
+    consolePrintf("[WiFi] get_ap_records failed: %d\n", err);
+    esp_wifi_clear_ap_list();
     lastWiFiScanCount = 0;
-    return;
+    return false;
   }
   lastWiFiScanCount = ap_count;
 
@@ -1782,7 +1892,7 @@ void scanWiFi() {
 
   if (ap_count == 0) {
     consolePrintln("No networks found");
-    return;
+    return true;  // Scan succeeded, just no results
   }
 
   // Process each AP
@@ -1884,6 +1994,7 @@ void scanWiFi() {
   }
 
   consolePrintln("--- WiFi Scan Complete ---\n");
+  return true;
 }
 
 void scanBluetooth() {

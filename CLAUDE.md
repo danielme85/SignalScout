@@ -14,8 +14,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Real-time OLED display showing GPS status, satellite count, compass, time, and speed
 - Logs all scan results to SD card via SPI
 - Outputs scan data to serial monitor for debugging
-- Hold mode button 1s to pause scanning (flushes SD card, shows "safe to power off")
-- Hold button again 1s to resume scanning
+- Hold mode button 1s to pause scanning (flushes SD card, opens settings menu)
+- In settings menu: short tap advances cursor, hold 1s activates selected item (toggle WiFi/BLE or resume)
 
 **File Sharing Mode (Hold button at boot):**
 - Hold the mode button while powering on — a 2-second window at boot selects this mode
@@ -63,14 +63,16 @@ The sketch uses FreeRTOS tasks for concurrent execution on the ESP32-C5's single
 **Thread Safety & Radio Sequencing:**
 - **Mutexes**: Protect shared resources (device maps, SD card access, display)
 - **Queue System**: Non-blocking log entry queue (50 entries) prevents SD card write conflicts
-- **Sequential Scanning**: WiFi and BLE scans run back-to-back within a single unified task to prevent radio conflicts on ESP32-C5's shared 2.4GHz radio:
-  - WiFi: Runs first (~3 seconds)
-  - BLE: Runs after WiFi completes (~3 seconds)
+- **Sequential Scanning**: WiFi and BLE scans run back-to-back within a single unified task. The ESP32-C5 hardware coexistence arbiter handles radio sharing automatically — BLE is initialized once and kept alive across cycles (NOT deinit/reinit per cycle, which corrupted radio state after 3-5 cycles):
+  - WiFi: Runs first (~3 seconds); `esp_wifi_clear_ap_list()` called before each cycle to flush stale state
+  - BLE: Runs after WiFi completes (~3 seconds); `pBLEScan->clearResults()` called after each scan
   - Cycle repeats every 10 seconds
+- **WiFi Failure Recovery**: consecutive WiFi scan failures are tracked; after 3 failures a deep `esp_wifi_stop()` + `esp_wifi_start()` reset is performed automatically
 
 The sketch is structured around four main components:
 
 1. **WiFi Scanner** (`scanWiFi()` function):
+   - Returns `bool` (true = success, false = scan failed — used for failure tracking)
    - Scans all available WiFi networks
    - Detects both 2.4GHz (channels 1-14) and 5GHz (channels >14) networks
    - Captures SSID, BSSID, RSSI, channel, frequency band, and encryption type
@@ -148,9 +150,11 @@ The sketch is structured around four main components:
 
 Key settings defined at the top of the sketch:
 
-- **Scanner Flags**:
-  - `ENABLE_WIFI_SCAN`: Enable/disable WiFi network scanning (default: true)
-  - `ENABLE_BLE_SCAN`: Enable/disable Bluetooth Low Energy scanning (default: true)
+- **Scanner Flags** (runtime `bool` variables, persisted in NVS via `Preferences`):
+  - `enableWifiScan`: Enable/disable WiFi network scanning (default: true)
+  - `enableBleScan`: Enable/disable Bluetooth Low Energy scanning (default: true)
+  - These are changed at runtime via the pause/settings menu and survive reboots
+  - Previously these were compile-time `#define` constants; do NOT revert to defines
 
 - **Output Flags**:
   - `ENABLE_CONSOLE_OUTPUT`: Enable/disable serial console output (default: false). Set to `false` in production to save processing time.
@@ -183,7 +187,11 @@ Key settings defined at the top of the sketch:
 - **Mode Control Button Pin**: GPIO23 (SHARE_BUTTON_PIN)
   - Active LOW, internal pullup enabled
   - **At boot**: hold button during power-on → file sharing mode (2-second window)
-  - **During scan**: hold 1 second → pause (flush SD, safe to power off); hold again → resume
+  - **During scan**: hold 1 second → pause (flushes SD, opens settings menu)
+  - **In settings menu**: short tap (<1s) advances cursor; hold 1s activates selected item
+    - Menu items: `WiFi: ON/OFF`, `BLE: ON/OFF`, `Resume Scan`
+    - Selected item shown inverted on OLED
+    - Toggles are saved to NVS immediately
   - Device boots into scan mode by default (waits for GPS signal)
   - GPS signal is acquired on boot before scanning begins
 
@@ -250,6 +258,9 @@ External libraries required (install via Library Manager):
 - `ESPAsyncWebServer` - Async web server for file sharing mode
 - `AsyncTCP` - TCP library required by ESPAsyncWebServer
 
+Built-in ESP32 Arduino core libraries (no separate install needed):
+- `Preferences` - NVS key-value storage for persisting runtime settings
+
 To install libraries:
 ```bash
 # Using Arduino CLI
@@ -310,8 +321,10 @@ The device has two primary operating modes:
    - Starts WiFi and BLE scanning tasks
    - Logs all scan results to SD card with GPS timestamps
    - Display shows real-time GPS data, device counts, and scanning status
-   - **Pause for safe power-off**: Hold mode button 1 second → pauses scanning, drains log
-     queue, waits for last SD write, shows "Safe to power off". Hold again 1s to resume.
+   - **Pause + settings**: Hold mode button 1 second → pauses scanning, drains log queue,
+     waits for last SD write, then shows settings menu. In menu: short tap advances cursor
+     through WiFi toggle / BLE toggle / Resume; long hold activates selection. Settings
+     persist to NVS (survive reboot).
 
 2. **File Sharing Mode:**
    - Selected at boot: hold the mode button while powering on (2-second window shown on display)
