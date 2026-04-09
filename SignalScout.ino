@@ -959,6 +959,17 @@ void loop() {
 void pauseScanning() {
   consolePrintln("\n=== PAUSING SCAN - flushing SD card ===");
 
+  // Immediate display feedback before the queue-drain wait
+  if (ENABLE_DISPLAY_OUTPUT) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(2, 0);
+    display.println("Pausing...");
+    display.setCursor(2, 16);
+    display.println("Flushing SD card");
+    display.display();
+  }
+
   // Stop new scans immediately
   if (unifiedScanTaskHandle != NULL) vTaskSuspend(unifiedScanTaskHandle);
   wifiScanning = false;
@@ -1493,6 +1504,17 @@ void configureServerRoutes() {
 void enterFileSharingMode() {
   consolePrintln("\n=== ENTERING FILE SHARING MODE ===");
   fileSharingMode = true;
+
+  // Immediate display feedback before radio init delays
+  if (ENABLE_DISPLAY_OUTPUT) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(2, 0);
+    display.println("File Share Mode");
+    display.setCursor(2, 16);
+    display.println("Loading...");
+    display.display();
+  }
 
   // Suspend scanning and logging tasks to avoid SD and radio conflicts (if they exist)
   if (unifiedScanTaskHandle != NULL) vTaskSuspend(unifiedScanTaskHandle);
