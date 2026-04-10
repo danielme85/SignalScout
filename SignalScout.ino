@@ -408,9 +408,15 @@ bool generateLogFileName() {
 // cycles — the ESP32-C5 hardware coexistence arbiter handles radio sharing automatically.
 // Repeatedly calling BLEDevice::init()/deinit() every cycle corrupts radio state after
 // 3-5 cycles, which is what was causing WiFi to hang. Keeping BLE initialized avoids this.
+// Proactive WiFi driver reset interval (ms). The driver silently degrades over long
+// sessions even when scans appear to succeed. Resetting every 5 minutes prevents the
+// 10-minute degradation without being frequent enough to noticeably interrupt scanning.
+#define WIFI_DRIVER_RESET_INTERVAL_MS (5UL * 60UL * 1000UL)
+
 void unifiedScanTask(void* parameter) {
   consolePrintln("[Scan Task] Unified scanner started");
   int wifiFailCount = 0;
+  unsigned long lastWifiDriverReset = millis();
 
   while (true) {
     if (!logFileReady) {
@@ -424,6 +430,22 @@ void unifiedScanTask(void* parameter) {
     // ===== WIFI SCAN =====
     if (enableWifiScan) {
       consolePrintln("\n[WiFi] Initializing radio...");
+
+      // Proactive deep reset every WIFI_DRIVER_RESET_INTERVAL_MS to prevent silent driver
+      // degradation. This runs before the scan setup so the driver starts each window fresh.
+      if (millis() - lastWifiDriverReset >= WIFI_DRIVER_RESET_INTERVAL_MS) {
+        consolePrintln("[WiFi] Scheduled proactive driver reset...");
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+        delay(300);
+        esp_wifi_stop();
+        delay(500);
+        esp_wifi_start();
+        delay(500);
+        wifiFailCount = 0;
+        lastWifiDriverReset = millis();
+        consolePrintln("[WiFi] Proactive reset complete");
+      }
 
       // Clear any leftover scan data from a previous cycle before changing mode
       esp_wifi_clear_ap_list();
@@ -472,6 +494,7 @@ void unifiedScanTask(void* parameter) {
         esp_wifi_start();
         delay(500);
         wifiFailCount = 0;
+        lastWifiDriverReset = millis();
         consolePrintln("[WiFi] Deep reset complete");
       }
     }

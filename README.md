@@ -1,10 +1,12 @@
-> **Disclaimer:** This project and code was written by Claude (Claude Sonnet 4.5). All design, implementation, and documentation were AI-generated to create a functional wireless scanning and GPS logging device.
+> **Disclaimer:** This project and code was written by Claude (Claude Sonnet 4.5/4.6). All design, implementation, and documentation were AI-generated to create a functional wireless scanning and GPS logging device.
 
 # SignalScout 📡
 
 **A portable WiFi and Bluetooth scanner with GPS tracking for ESP32-C5**
 
-![Logo](./Untitled.jpeg)
+<p align="center">
+  <img src="./Untitled.jpeg" alt="SignalScout Logo">
+</p>
 
 SignalScout is a wardriving and wireless reconnaissance tool that scans 2.4GHz and 5GHz WiFi networks and Bluetooth Low Energy (BLE) devices, logging everything to an SD card with precise GPS coordinates and timestamps.
 
@@ -13,14 +15,15 @@ SignalScout is a wardriving and wireless reconnaissance tool that scans 2.4GHz a
 - 📶 Dual-band WiFi scanning (2.4GHz & 5GHz)
 - 🔵 Bluetooth Low Energy (BLE) device discovery
 - 📍 GPS-tagged logging with location, altitude, and satellite data
-- 📊 Real-time OLED display with stats and countdown
+- 📊 Real-time OLED display with stats and scanning indicators
 - 💾 CSV logging to SD card for mapping and analysis
 - 🧭 Built-in compass and speed display
 - 🔒 Encryption type detection
 - 🔋 Battery level monitoring with on-screen indicator
 - 💡 RGB LED status indicator during boot sequence
 - 📁 SD card file sharing over WiFi (browse and download log files from a browser)
-- 😴 Deep sleep mode for battery conservation (button-controlled)
+- 🚔 Flock Safety / SoundThinking device detection with visual alert
+- 🔁 Self-healing WiFi driver with proactive periodic resets for long-session stability
 
 ## Hardware Required
 
@@ -58,6 +61,7 @@ The OLED display provides real-time visual feedback, updating every 1 second:
 ├──────────────────────────────────────────────┤
 │ W:12(47)*              (WiFi logo)           │  ← WiFi: last(total)*
 │ B:8(23)                                      │  ← BLE: last(total)
+│ FLOCK:2 ◄ inverted alert                     │  ← Flock device count (if any detected)
 ├──────────────────────────────────────────────┤
 │ 14:23:57                       45MPH 72KPH   │  ← GPS time (UTC) | Speed (MPH/KPH)
 └──────────────────────────────────────────────┘
@@ -74,6 +78,7 @@ The OLED display provides real-time visual feedback, updating every 1 second:
   - Number in parentheses = total unique devices seen since boot
   - **Asterisk (*)** appears when actively scanning (e.g., "W:5(23)*" during WiFi scan)
 - **Center Right:** Animated WiFi logo
+- **Flock Alert Row:** `FLOCK:N` shown inverted (black-on-white) when any Flock Safety device has been detected. A full-screen blinking "GET FLOCKED!" alert appears for 3 seconds on first detection of each new device.
 - **Bottom Left:** Current UTC time from GPS in HH:MM:SS format (2px left margin, updates every second)
 - **Bottom Right:** Current speed in MPH and KPH format (2px right margin, right-aligned)
 
@@ -159,7 +164,6 @@ Go to Tools → Manage Libraries and install:
    - 🟠 **Orange** = Waiting for GPS signal
    - 🟢 **Green** = Ready, about to start scanning
    - ⚫ **Off** = Scanning active (LED off to save battery)
-   - 🔵 **Blue** = File sharing mode active
 3. **Wait for GPS lock** - display shows "Waiting GPS" with satellite count and elapsed time (30-60 seconds)
 4. **Scans run automatically** after GPS lock, every 10 seconds:
    - WiFi scans for ~3 seconds (asterisk appears: `W:12(47)*`)
@@ -168,29 +172,51 @@ Go to Tools → Manage Libraries and install:
 6. **Start moving** to see compass direction and speed (requires >1 km/h movement)
 7. **Data is logged** to `/scan_YYYYMMDD_HHMMSS.txt` on the SD card after each scan completes
 
-### Button Controls (GPIO23)
+## Button Controls (GPIO23)
 
-The push button on GPIO23 is a multi-function control. Hold duration determines the action:
+The push button on GPIO23 serves different functions depending on **when** you press it:
+
+### At Boot (2-second window)
 
 | Action | How |
 |--------|-----|
-| **Toggle file sharing** | Press and hold for 1 second, then **release** (before 3s) |
-| **Enter deep sleep** | Press and hold for 3 seconds (no release needed) |
-| **Wake from sleep** | Press the button while device is sleeping (triggers reboot) |
+| **Enter file sharing mode** | Hold the button while powering on and keep holding through the 2-second countdown shown on the display |
+| **Normal scan mode** | Power on with button released (default) |
 
-> Releasing the button before 1 second does nothing. If you hold past 3 seconds the device enters sleep regardless — it will exit file sharing mode first if that was active.
+### During Scanning
+
+| Action | How |
+|--------|-----|
+| **Pause + open settings menu** | Hold for 1 second |
+
+### In Settings Menu
+
+| Action | How |
+|--------|-----|
+| **Advance cursor** | Short tap (<1 second) |
+| **Activate selected item** | Hold for 1 second |
+
+**Settings menu items:**
+- `WiFi: ON/OFF` — toggle WiFi scanning (saved to flash, survives reboot)
+- `BLE: ON/OFF` — toggle BLE scanning (saved to flash, survives reboot)
+- `Resume Scan` — exit settings and resume scanning
+
+The currently selected item is shown inverted on the display. Pausing flushes the SD card log queue before opening the menu so no data is lost.
 
 ## File Sharing Mode
 
 File sharing mode gives you wireless access to all log files on the SD card without removing it from the device.
 
+### How to Enter
+
+Hold the mode button **while powering on**. The display shows a 2-second countdown — keep holding until it completes. Release once the countdown finishes and the device switches to file sharing mode.
+
 ### How It Works
 
-1. **Enter:** Hold the button for 1 second and release. All scanning tasks pause.
-2. The device connects to your WiFi network using credentials from `secrets.h` (10-second timeout).
-3. The OLED displays the assigned IP address and the LED turns **blue**.
-4. Open `http://<IP>` in any browser on the same network — you'll see a file listing page with clickable download links for every file on the SD card root.
-5. **Exit:** Hold the button for 1 second and release again. The web server stops, WiFi disconnects, and scanning resumes automatically.
+1. The device connects to your WiFi network using credentials from `secrets.h`.
+2. The OLED displays the assigned IP address.
+3. Open `http://<IP>` in any browser on the same network — you'll see a file listing page with clickable download links for every file on the SD card.
+4. **To return to scan mode:** power off the device, then boot normally (button not held).
 
 ### Setting Up `secrets.h`
 
@@ -208,18 +234,48 @@ const char* WIFI_PASSWORD = "YourNetworkPassword";
 
 > This file is listed in `.gitignore` so your credentials won't be committed to version control.
 
+## Flock Safety Detection
+
+SignalScout automatically identifies **Flock Safety** (now SoundThinking) license plate readers and Raven acoustic gunshot sensors while scanning. These are fixed surveillance cameras commonly found on utility poles and street furniture.
+
+Signatures are sourced from [MaxwellDPS/Flock-You-Android](https://github.com/MaxwellDPS/Flock-You-Android).
+
+### What It Detects
+
+**WiFi (via SSID prefix or hardware OUI):**
+- SSID prefixes: `flock`, `fs-`, `fs_`, `falcon`, `sparrow`, `condor`
+- Quectel LTE modem OUIs: `50:29:4D`, `86:25:19`
+- Telit LTE modem OUIs: `00:14:2D`, `D8:C7:71`
+
+**BLE (via device name or service UUID):**
+- Device name prefixes: `flock`, `falcon`, `raven`
+- Raven service UUIDs: `00003100` (GPS Location), `00003200` (Power Management), `00003300` (Audio/Detection), `00003400` (Config/Status), `00003500` (Error/Diagnostics)
+
+### Visual Alerts
+
+- **Full-screen blinking alert:** When a new Flock device is detected for the first time, the display shows a blinking **"GET FLOCKED!"** message for 3 seconds.
+- **Persistent counter:** After the alert, `FLOCK:N` is shown inverted (white background) in the device count area for the remainder of the session.
+
+### Log Output
+
+Flock devices are logged with a distinct type field:
+- `FLOCK-WIFI` instead of `WIFI`
+- `FLOCK-BLE` instead of `BLE`
+
+All other fields (GPS coordinates, signal strength, fingerprint, etc.) are identical to standard entries.
+
 ## Log File Format
 
 Each log file begins with a comprehensive header documenting all column formats and field descriptions. Each device is then logged on one line with complete GPS data in CSV format.
 
 ### Column Headers
 
-**WiFi Format:**
+**WiFi / Flock-WiFi Format:**
 ```
 Type,Fingerprint,Timestamp,Latitude,Longitude,Altitude,Satellites,HDOP,SSID,BSSID,RSSI,Channel,Band,Encryption
 ```
 
-**BLE Format:**
+**BLE / Flock-BLE Format:**
 ```
 Type,Fingerprint,Timestamp,Latitude,Longitude,Altitude,Satellites,HDOP,Name,Address,RSSI,ManufacturerData,ServiceUUID
 ```
@@ -227,6 +283,7 @@ Type,Fingerprint,Timestamp,Latitude,Longitude,Altitude,Satellites,HDOP,Name,Addr
 ### Field Descriptions
 
 **Common Fields:**
+- **Type**: `WIFI`, `BLE`, `FLOCK-WIFI`, or `FLOCK-BLE`
 - **Fingerprint**: 8-character hex ID derived from device MAC address (stable, unique identifier)
 - **Timestamp**: UTC time from GPS (`YYYY-MM-DD HH:MM:SS`) or RTC with `(RTC)` suffix
 - **Latitude/Longitude**: GPS coordinates in decimal degrees
@@ -261,10 +318,15 @@ WIFI,3C7B6E95,2026-01-24 22:57:04,41.342822,-81.389317,327.20,8,1.34,MyHomeNetwo
 BLE,FA2FAF58,2026-01-24 22:57:16,41.342820,-81.389308,327.90,8,1.34,Smart Watch,58:D9:FA:AF:2F:FD,-65,4C001005,0000180A
 ```
 
+**Flock Safety camera (WiFi):**
+```
+FLOCK-WIFI,A1B2C3D4,2026-01-24 22:57:20,41.342825,-81.389310,327.50,8,1.34,fs-cam-4821,50:29:4D:AA:BB:CC,-72,6,2.4GHz,WPA2-PSK
+```
+
 **Notes:**
 - All strings sanitized to printable ASCII (no garbage characters)
 - BLE manufacturer data shown as clean hex
-- CSV format - easily imported to Excel, Python, GIS tools
+- CSV format — easily imported to Excel, Python, GIS tools
 - Same device always gets same fingerprint across scans
 
 ## Configuration
@@ -273,19 +335,29 @@ WiFi credentials for file sharing are stored separately in `secrets.h` (see [Fil
 
 ```cpp
 // Output control
-#define ENABLE_CONSOLE_OUTPUT false  // Serial console output
+#define ENABLE_CONSOLE_OUTPUT false  // Serial console output (set true for debugging)
 #define ENABLE_DISPLAY_OUTPUT true   // OLED display
 #define ENABLE_LOG_OUTPUT true       // SD card logging
 
 // Timing
-#define SCAN_INTERVAL 10           // Scan cycle repeats every 10 seconds
-#define BLE_SCAN_TIME 3            // BLE scan duration: 3 seconds
+#define SCAN_INTERVAL 10             // Scan cycle repeats every 10 seconds
+#define BLE_SCAN_TIME 3              // BLE scan duration: 3 seconds
 // WiFi scans for ~3 seconds
 // Scans run sequentially: WiFi → BLE → repeat
+
+// WiFi driver stability
+#define WIFI_DRIVER_RESET_INTERVAL_MS (5UL * 60UL * 1000UL)  // Proactive reset every 5 min
 
 // Battery voltage divider
 #define VOLTAGE_DIVIDER_RATIO 3.333333  // For 200k/100k divider
 ```
+
+### Runtime Settings (persisted in flash)
+
+The pause/settings menu lets you toggle scanning modes at runtime without reflashing. These settings survive reboots:
+
+- **WiFi scanning** — enable or disable WiFi scanning
+- **BLE scanning** — enable or disable BLE scanning
 
 ## Troubleshooting
 
@@ -295,14 +367,15 @@ WiFi credentials for file sharing are stored separately in `secrets.h` (see [Fil
 | **"Waiting GPS" forever** | GPS needs clear sky view, move outdoors, wait up to 2 minutes for cold start |
 | **Display shows nothing** | Verify OLED wiring, check if SSD1309/SSD1306 is set correctly in code |
 | **No WiFi networks found** | Normal in remote areas, verify ESP32 WiFi is working |
+| **WiFi stops working after ~10 min** | The proactive 5-minute driver reset should prevent this; reduce `WIFI_DRIVER_RESET_INTERVAL_MS` if still occurring |
 | **Compass shows "---"** | GPS course requires movement >1 km/h, start walking/driving |
 | **LED stays red** | Initialization stuck, check serial monitor for errors |
 | **LED stays orange** | GPS not getting signal, move to open sky area |
 | **Battery shows 0% or wrong** | Check voltage divider wiring, adjust `VOLTAGE_DIVIDER_RATIO` in code |
 | **File sharing WiFi fails** | Verify SSID and password in `secrets.h`, ensure device is within range of your network |
-| **File sharing not starting** | Check button wiring (GPIO23 to GND), hold for a full second before releasing |
+| **File sharing mode not entering** | Hold button during boot and keep holding through the full 2-second countdown on screen |
 | **No files listed in browser** | SD card must be mounted and contain files in the root directory |
-| **Device won't wake from sleep** | Press the button; ensure GPIO23 wiring is secure |
+| **Settings not saving** | NVS write failure — check serial output; reflash if NVS is corrupted |
 
 ## Data Analysis
 
@@ -330,5 +403,6 @@ Open source - feel free to modify and share!
 
 **Built with ❤️ for wireless explorers and makers**
 
-
-![ScoutCat](signalscoutcat.gif)
+<p align="center">
+  <img src="./signalscoutcat.gif" alt="SignalScout Cat">
+</p>

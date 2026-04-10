@@ -68,6 +68,7 @@ The sketch uses FreeRTOS tasks for concurrent execution on the ESP32-C5's single
   - BLE: Runs after WiFi completes (~3 seconds); `pBLEScan->clearResults()` called after each scan
   - Cycle repeats every 10 seconds
 - **WiFi Failure Recovery**: consecutive WiFi scan failures are tracked; after 3 failures a deep `esp_wifi_stop()` + `esp_wifi_start()` reset is performed automatically
+- **Proactive WiFi Driver Reset**: regardless of failure state, the driver is fully reset every `WIFI_DRIVER_RESET_INTERVAL_MS` (default 5 minutes) to prevent silent degradation that causes scans to stop working after long sessions. This reset runs before the scan setup in each cycle when the interval has elapsed. Adjust the `#define` if degradation occurs sooner.
 
 The sketch is structured around four main components:
 
@@ -104,14 +105,29 @@ The sketch is structured around four main components:
    - **Center Left**: Device counts - WiFi "W:X(XX)", BLE "B:X(XX)"
      - Asterisk (*) appears after count when actively scanning (e.g., "W:5(23)*")
      - Shows last scan count and total unique devices seen
+   - **Flock Alert Row**: `FLOCK:N` shown inverted (black-on-white) when Flock devices have been seen
+     - Full-screen blinking "GET FLOCKED!" alert fires for 3 seconds on first detection of each new Flock device
+     - Display update rate increases to 250ms during alert for smooth blinking, then returns to 1000ms
    - **Center Right**: Animated WiFi logo
    - **Bottom Left**: GPS time in HH:MM:SS UTC format (2px left margin, updates every second)
    - **Bottom Right**: Speed in both MPH and KPH (2px right margin, right-aligned)
    - All display elements use consistent 2px margins on left and right edges
 
-5. **Device Tracking**:
+5. **Flock Safety Detection** (`isFlockWiFi()` / `isFlockBLE()` functions):
+   - Identifies Flock Safety (SoundThinking) license plate readers and Raven acoustic sensors
+   - Signatures sourced from `github.com/MaxwellDPS/Flock-You-Android`
+   - WiFi detection: SSID prefix matching (`flock`, `fs-`, `fs_`, `falcon`, `sparrow`, `condor`) + Quectel/Telit LTE modem OUIs
+   - BLE detection: device name prefix matching + Raven-specific service UUIDs (`0000310x`–`0000350x`)
+   - Detected devices are logged as `FLOCK-WIFI` or `FLOCK-BLE` (instead of `WIFI`/`BLE`) in the log file
+   - `uniqueFlockCount` tracked separately from WiFi/BLE counts
+   - On new detection: sets `flockAlertUntilMs = millis() + 3000` to trigger full-screen blinking display alert
+   - Display shows `FLOCK:N` in inverted text (black-on-white) persistently while `uniqueFlockCount > 0`
+   - Display update interval drops to 250ms during Flock alert (instead of 1000ms) for smooth blinking
+
+6. **Device Tracking**:
    - Maintains count of unique WiFi devices seen (by BSSID)
    - Maintains count of unique BLE devices seen (by address)
+   - Maintains count of unique Flock Safety devices seen
    - Generates 8-character hexadecimal fingerprint for each device
    - Fingerprints used for device identification and tracking
 
@@ -125,6 +141,7 @@ The sketch is structured around four main components:
    - Format: `TYPE,Fingerprint,Timestamp,Lat,Lon,Alt,Sats,HDOP,DeviceParams...`
    - WiFi format: `WIFI,FP,Time,Lat,Lon,Alt,Sats,HDOP,SSID,BSSID,RSSI,Ch,Band,Enc`
    - BLE format: `BLE,FP,Time,Lat,Lon,Alt,Sats,HDOP,Name,Addr,RSSI,ManufData,ServiceUUID`
+   - Flock devices use `FLOCK-WIFI` or `FLOCK-BLE` as the type field; all other columns are identical
    - GPS data included with every device entry for location tracking
    - Falls back to RTC time when GPS not available (marked with "(RTC)" suffix)
    - Dedicated SD logger task runs with highest priority (3) for reliable logging
