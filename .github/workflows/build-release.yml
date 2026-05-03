@@ -1,0 +1,115 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:   # allow manual test builds without tagging
+
+permissions:
+  contents: write      # needed to create GitHub Releases
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Arduino CLI ────────────────────────────────────────────────────────
+      - name: Install arduino-cli
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Configure board manager and enable unsafe lib install
+        run: |
+          arduino-cli config init
+          arduino-cli config set board_manager.additional_urls \
+            https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli config set library.enable_unsafe_install true
+
+      - name: Install ESP32 Arduino core
+        run: |
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32
+
+      # ── Libraries ─────────────────────────────────────────────────────────
+      - name: Install libraries from Library Manager
+        run: |
+          arduino-cli lib install "TinyGPSPlus"
+          arduino-cli lib install "Adafruit GFX Library"
+          arduino-cli lib install "Adafruit SSD1306"
+          arduino-cli lib install "Adafruit NeoPixel"
+          arduino-cli lib install "ESP32Time"
+
+      # ESPAsyncWebServer and its AsyncTCP dependency are not in the
+      # official Library Manager; install directly from GitHub.
+      - name: Install AsyncTCP and ESPAsyncWebServer from GitHub
+        run: |
+          arduino-cli lib install \
+            --git-url https://github.com/me-no-dev/AsyncTCP.git
+          arduino-cli lib install \
+            --git-url https://github.com/me-no-dev/ESPAsyncWebServer.git
+
+      # ── Secrets stub ──────────────────────────────────────────────────────
+      # secrets.h is gitignored (contains WiFi credentials for file-sharing
+      # mode). A placeholder is sufficient for compilation; no actual
+      # credentials are needed or embedded in CI builds.
+      - name: Create placeholder secrets.h
+        run: |
+          cat > SignalScout/secrets.h << 'EOF'
+          #ifndef SECRETS_H
+          #define SECRETS_H
+          const char* WIFI_SSID     = "";
+          const char* WIFI_PASSWORD = "";
+          #endif
+          EOF
+
+      # ── Compile ───────────────────────────────────────────────────────────
+      # Board: ESP32-C5 (16 MB flash, 8 MB PSRAM).
+      # Adjust FlashSize / PSRAM options if your hardware differs.
+      - name: Compile sketch
+        run: |
+          arduino-cli compile \
+            --fqbn "esp32:esp32:esp32c5:FlashSize=16M,PartitionScheme=default,PSRAM=enabled" \
+            --export-binaries \
+            --output-dir build \
+            SignalScout
+
+      - name: List build output
+        run: ls -lh build/
+
+      # ── Merge into a single flashable binary ──────────────────────────────
+      # Produces SignalScout-merged.bin that can be flashed at address 0x0
+      # with esptool.py or the Espressif Flash Download Tool.
+      - name: Merge bootloader + partition table + app into one binary
+        run: |
+          pip install esptool --quiet
+          esptool.py --chip esp32c5 merge_bin \
+            --output build/SignalScout-merged.bin \
+            0x0     build/SignalScout.ino.bootloader.bin \
+            0x8000  build/SignalScout.ino.partitions.bin \
+            0x10000 build/SignalScout.ino.bin
+
+      # ── Artifacts (every run) ─────────────────────────────────────────────
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SignalScout-firmware-${{ github.ref_name || github.sha }}
+          path: |
+            build/SignalScout.ino.bin
+            build/SignalScout.ino.bootloader.bin
+            build/SignalScout.ino.partitions.bin
+            build/SignalScout-merged.bin
+
+      # ── GitHub Release (tag pushes only) ──────────────────────────────────
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "SignalScout ${{ github.ref_name }}"
+          generate_release_notes: true
+          files: |
+            build/SignalScout-merged.bin
+            build/SignalScout.ino.bin
+            build/SignalScout.ino.bootloader.bin
+            build/SignalScout.ino.partitions.bin
