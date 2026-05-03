@@ -71,7 +71,7 @@ jobs:
       - name: Compile sketch
         run: |
           arduino-cli compile \
-            --fqbn "esp32:esp32:esp32c5:FlashSize=16M,PartitionScheme=default,PSRAM=enabled" \
+            --fqbn "esp32:esp32:esp32c5:FlashSize=16M,PartitionScheme=huge_app,PSRAM=enabled" \
             --export-binaries \
             --output-dir build \
             .
