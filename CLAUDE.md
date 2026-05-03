@@ -15,7 +15,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Logs all scan results to SD card via SPI
 - Outputs scan data to serial monitor for debugging
 - Hold mode button 1s to pause scanning (flushes SD card, opens settings menu)
-- In settings menu: short tap advances cursor, hold 1s activates selected item (toggle WiFi/BLE or resume)
+- In settings menu: short tap advances cursor, hold 1s activates selected item (toggle WiFi/BLE/Flock-only or resume)
 
 **File Sharing Mode (Hold button at boot):**
 - Hold the mode button while powering on — a 2-second window at boot selects this mode
@@ -40,9 +40,12 @@ This is an Arduino sketch (.ino file) that should be developed using:
 - Arduino CLI, or
 - PlatformIO
 
+**CI/CD:** GitHub Actions (`.github/workflows/build-release.yml`) compiles the sketch on every `v*` tag push using arduino-cli + the ESP32 core, then creates a GitHub Release with the compiled binaries attached. Push a tag (`git tag vX.Y.Z && git push origin vX.Y.Z`) to trigger a release. `workflow_dispatch` allows manual test builds without tagging. The workflow creates a stub `secrets.h` at compile time (empty credentials) — the gitignored real file is never committed or embedded in releases.
+
 ## File Structure
 
 - `SignalScout.ino` - Main Arduino sketch with WiFi/BLE scanning and SD card logging
+- `.github/workflows/build-release.yml` - GitHub Actions CI: compiles on tag push, creates GitHub Release with merged binary attached
 
 ## Architecture
 
@@ -105,7 +108,11 @@ The sketch is structured around four main components:
    - **Center Left**: Device counts - WiFi "W:X(XX)", BLE "B:X(XX)"
      - Asterisk (*) appears after count when actively scanning (e.g., "W:5(23)*")
      - Shows last scan count and total unique devices seen
-   - **Flock Alert Row**: `FLOCK:N` shown inverted (black-on-white) when Flock devices have been seen
+     - `W:--` / `B:--` shown when that scanner is disabled
+   - **Flock Row** (below BLE count): one of three states:
+     - `FLOCK:N` inverted (black-on-white) — Flock devices detected this session
+     - `[FLOCK ONLY]` — flock-only mode active, no Flock devices found yet
+     - blank — normal mode, no Flock devices seen
      - Full-screen blinking "GET FLOCKED!" alert fires for 3 seconds on first detection of each new Flock device
      - Display update rate increases to 250ms during alert for smooth blinking, then returns to 1000ms
    - **Center Right**: Animated WiFi logo
@@ -114,15 +121,20 @@ The sketch is structured around four main components:
    - All display elements use consistent 2px margins on left and right edges
 
 5. **Flock Safety Detection** (`isFlockWiFi()` / `isFlockBLE()` functions):
-   - Identifies Flock Safety (SoundThinking) license plate readers and Raven acoustic sensors
-   - Signatures sourced from `github.com/MaxwellDPS/Flock-You-Android`
-   - WiFi detection: SSID prefix matching (`flock`, `fs-`, `fs_`, `falcon`, `sparrow`, `condor`) + Quectel/Telit LTE modem OUIs
-   - BLE detection: device name prefix matching + Raven-specific service UUIDs (`0000310x`–`0000350x`)
+   - Identifies Flock Safety (SoundThinking) license plate readers, Penguin external batteries, and Raven acoustic sensors
+   - Signatures sourced from `github.com/MaxwellDPS/Flock-You-Android` and `github.com/justcallmekoko/ESP32Marauder`
+   - WiFi SSID prefixes: `flock`, `fs-`, `fs_`, `falcon`, `sparrow`, `condor`, `penguin`, `pigvision`, `fs ext batt`
+   - WiFi OUIs: Quectel (`50:29:4D`, `86:25:19`), Telit (`00:14:2D`, `D8:C7:71`), Flock Safety direct (`B4:1E:52`)
+   - BLE name prefixes: `flock`, `falcon`, `raven`, `penguin-`, `fs ext batt`, `soundthinking`, `shotspotter`
+   - BLE service UUIDs (firmware 1.2.x+): `0000310x`–`0000350x`; legacy (1.1.x): `00001809`, `00001819`
+   - BLE manufacturer data: Xuntong company ID `0x09C8` (hex prefix `C809`) — Penguin battery ODM chip
+   - `isFlockBLE()` takes three args: `name`, `serviceUUID`, `manufDataHex`
    - Detected devices are logged as `FLOCK-WIFI` or `FLOCK-BLE` (instead of `WIFI`/`BLE`) in the log file
    - `uniqueFlockCount` tracked separately from WiFi/BLE counts
    - On new detection: sets `flockAlertUntilMs = millis() + 3000` to trigger full-screen blinking display alert
    - Display shows `FLOCK:N` in inverted text (black-on-white) persistently while `uniqueFlockCount > 0`
    - Display update interval drops to 250ms during Flock alert (instead of 1000ms) for smooth blinking
+   - **Flock-only mode** (`flockOnlyMode` bool, NVS key `"flockonly"`): when true, non-Flock devices are skipped via `continue` immediately after detection check in both `scanWiFi()` and `scanBluetooth()` — nothing counted, logged, or displayed for non-Flock hits
 
 6. **Device Tracking**:
    - Maintains count of unique WiFi devices seen (by BSSID)
@@ -170,6 +182,7 @@ Key settings defined at the top of the sketch:
 - **Scanner Flags** (runtime `bool` variables, persisted in NVS via `Preferences`):
   - `enableWifiScan`: Enable/disable WiFi network scanning (default: true)
   - `enableBleScan`: Enable/disable Bluetooth Low Energy scanning (default: true)
+  - `flockOnlyMode`: When true, non-Flock devices are silently ignored — not counted, not logged (default: false)
   - These are changed at runtime via the pause/settings menu and survive reboots
   - Previously these were compile-time `#define` constants; do NOT revert to defines
 
@@ -206,7 +219,7 @@ Key settings defined at the top of the sketch:
   - **At boot**: hold button during power-on → file sharing mode (2-second window)
   - **During scan**: hold 1 second → pause (flushes SD, opens settings menu)
   - **In settings menu**: short tap (<1s) advances cursor; hold 1s activates selected item
-    - Menu items: `WiFi: ON/OFF`, `BLE: ON/OFF`, `Resume Scan`
+    - Menu items: `WiFi: ON/OFF`, `BLE: ON/OFF`, `Flock: ON/OFF`, `Resume Scan` (4 items, cursor wraps)
     - Selected item shown inverted on OLED
     - Toggles are saved to NVS immediately
   - Device boots into scan mode by default (waits for GPS signal)
@@ -340,8 +353,8 @@ The device has two primary operating modes:
    - Display shows real-time GPS data, device counts, and scanning status
    - **Pause + settings**: Hold mode button 1 second → pauses scanning, drains log queue,
      waits for last SD write, then shows settings menu. In menu: short tap advances cursor
-     through WiFi toggle / BLE toggle / Resume; long hold activates selection. Settings
-     persist to NVS (survive reboot).
+     through WiFi toggle / BLE toggle / Flock-only toggle / Resume; long hold activates selection.
+     Settings persist to NVS (survive reboot).
 
 2. **File Sharing Mode:**
    - Selected at boot: hold the mode button while powering on (2-second window shown on display)

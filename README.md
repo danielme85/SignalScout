@@ -77,10 +77,46 @@ The OLED display provides real-time visual feedback, updating every 1 second:
   - First number = devices found in last scan
   - Number in parentheses = total unique devices seen since boot
   - **Asterisk (*)** appears when actively scanning (e.g., "W:5(23)*" during WiFi scan)
+  - **`W:--` / `B:--`** shown when WiFi or BLE scanning is disabled
 - **Center Right:** Animated WiFi logo
-- **Flock Alert Row:** `FLOCK:N` shown inverted (black-on-white) when any Flock Safety device has been detected. A full-screen blinking "GET FLOCKED!" alert appears for 3 seconds on first detection of each new device.
+- **Flock Row:** Shows one of three states:
+  - `FLOCK:N` inverted (black-on-white) — one or more Flock devices detected this session
+  - `[FLOCK ONLY]` — Flock-only mode is active but no devices found yet
+  - *(blank)* — normal mode, no Flock devices seen
+  - A full-screen blinking "GET FLOCKED!" alert appears for 3 seconds on first detection of each new device.
 - **Bottom Left:** Current UTC time from GPS in HH:MM:SS format (2px left margin, updates every second)
 - **Bottom Right:** Current speed in MPH and KPH format (2px right margin, right-aligned)
+
+## Pre-built Firmware
+
+Every tagged release on GitHub includes ready-to-flash firmware built automatically by GitHub Actions. No Arduino IDE required to flash.
+
+### Files in each release
+
+| File | Use |
+|------|-----|
+| `SignalScout-merged.bin` | **Recommended** — single file, flash at address `0x0` |
+| `SignalScout.ino.bin` | App only — flash at `0x10000` |
+| `SignalScout.ino.bootloader.bin` | Bootloader — flash at `0x0` |
+| `SignalScout.ino.partitions.bin` | Partition table — flash at `0x8000` |
+
+### Flashing with esptool.py
+
+```bash
+# Easiest — merged binary, single command
+esptool.py --chip esp32c5 --port /dev/ttyUSB0 write_flash 0x0 SignalScout-merged.bin
+```
+
+### Releasing a new version
+
+Push a tag and GitHub Actions builds and publishes automatically:
+
+```bash
+git tag v1.2.0
+git push origin v1.2.0
+```
+
+The workflow installs arduino-cli, the ESP32 core, and all required libraries, then compiles and attaches the binaries to the release. `secrets.h` is not included in any release binary — you must supply your own WiFi credentials by flashing a build from source, or the file-sharing mode simply won't connect (all other features work without it).
 
 ## Quick Start Guide
 
@@ -199,6 +235,7 @@ The push button on GPIO23 serves different functions depending on **when** you p
 **Settings menu items:**
 - `WiFi: ON/OFF` — toggle WiFi scanning (saved to flash, survives reboot)
 - `BLE: ON/OFF` — toggle BLE scanning (saved to flash, survives reboot)
+- `Flock: ON/OFF` — toggle Flock-only mode; when ON, non-Flock devices are ignored entirely (not counted, not logged)
 - `Resume Scan` — exit settings and resume scanning
 
 The currently selected item is shown inverted on the display. Pausing flushes the SD card log queue before opening the menu so no data is lost.
@@ -236,20 +273,33 @@ const char* WIFI_PASSWORD = "YourNetworkPassword";
 
 ## Flock Safety Detection
 
-SignalScout automatically identifies **Flock Safety** (now SoundThinking) license plate readers and Raven acoustic gunshot sensors while scanning. These are fixed surveillance cameras commonly found on utility poles and street furniture.
+SignalScout automatically identifies **Flock Safety** (now SoundThinking) license plate readers, Penguin external battery packs, and Raven acoustic gunshot sensors while scanning. These are fixed surveillance devices commonly found on utility poles and street furniture.
 
-Signatures are sourced from [MaxwellDPS/Flock-You-Android](https://github.com/MaxwellDPS/Flock-You-Android).
+Signatures are sourced from [MaxwellDPS/Flock-You-Android](https://github.com/MaxwellDPS/Flock-You-Android) and [justcallmekoko/ESP32Marauder](https://github.com/justcallmekoko/ESP32Marauder).
 
 ### What It Detects
 
 **WiFi (via SSID prefix or hardware OUI):**
-- SSID prefixes: `flock`, `fs-`, `fs_`, `falcon`, `sparrow`, `condor`
+- SSID prefixes: `flock`, `fs-`, `fs_`, `falcon`, `sparrow`, `condor`, `penguin`, `pigvision`, `fs ext batt`
 - Quectel LTE modem OUIs: `50:29:4D`, `86:25:19`
 - Telit LTE modem OUIs: `00:14:2D`, `D8:C7:71`
+- Flock Safety registered OUI: `B4:1E:52`
 
-**BLE (via device name or service UUID):**
-- Device name prefixes: `flock`, `falcon`, `raven`
-- Raven service UUIDs: `00003100` (GPS Location), `00003200` (Power Management), `00003300` (Audio/Detection), `00003400` (Config/Status), `00003500` (Error/Diagnostics)
+**BLE (via device name, service UUID, or manufacturer data):**
+- Device name prefixes: `flock`, `falcon`, `raven`, `penguin-`, `fs ext batt`, `soundthinking`, `shotspotter`
+- Raven service UUIDs (firmware 1.2.x+): `00003100` (GPS Location), `00003200` (Power Management), `00003300` (Network Status), `00003400` (Upload Statistics), `00003500` (Error/Diagnostics)
+- Legacy Raven service UUIDs (firmware 1.1.x): `00001809`, `00001819`
+- Xuntong manufacturer data (`C809` prefix) — identifies Flock Penguin external battery packs by ODM chip
+
+### Flock-Only Mode
+
+Enable **Flock-only mode** from the pause/settings menu (`Flock: ON`) to filter out all non-Flock devices. When active:
+- WiFi and BLE scans still run normally
+- Any device that doesn't match a Flock signature is silently ignored — not counted, not logged, not displayed
+- The display shows `[FLOCK ONLY]` in the stats area until a Flock device is found
+- The setting persists across reboots (saved to flash)
+
+This mode is useful when you're specifically hunting for Flock cameras and don't want surrounding noise cluttering your log.
 
 ### Visual Alerts
 
@@ -358,6 +408,7 @@ The pause/settings menu lets you toggle scanning modes at runtime without reflas
 
 - **WiFi scanning** — enable or disable WiFi scanning
 - **BLE scanning** — enable or disable BLE scanning
+- **Flock-only mode** — when enabled, ignore all non-Flock devices (nothing counted or logged)
 
 ## Troubleshooting
 

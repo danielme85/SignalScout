@@ -78,8 +78,9 @@
 #define BLE_SCAN_TIME 3      // BLE scan duration in seconds
 
 // Scanner enable/disable flags (runtime bools, persisted in NVS, changeable via pause menu)
-bool enableWifiScan = true;  // Enable/disable WiFi scanning
-bool enableBleScan  = true;  // Enable/disable BLE scanning
+bool enableWifiScan = true;   // Enable/disable WiFi scanning
+bool enableBleScan  = true;   // Enable/disable BLE scanning
+bool flockOnlyMode  = false;  // When true, ignore all non-Flock devices
 
 // Output enable/disable flags
 #define ENABLE_CONSOLE_OUTPUT false   // Enable/disable serial console output
@@ -189,7 +190,7 @@ bool fileSharingMode = false;
 bool scanMode = false;
 bool scanTasksStarted = false;
 bool scanPaused = false;  // Scan paused for safe power-off (button hold in scan mode)
-int  pauseMenuCursor = 0; // 0=WiFi toggle, 1=BLE toggle, 2=Resume
+int  pauseMenuCursor = 0; // 0=WiFi toggle, 1=BLE toggle, 2=Flock Only toggle, 3=Resume
 Preferences prefs;        // NVS key-value store for settings persistence
 unsigned long gpsWaitStart = 0; // When GPS wait began (for elapsed time display)
 int gpsWaitDotCount = 0;        // Dot animation counter for GPS wait console output
@@ -313,18 +314,22 @@ void ledFileSharing() {
 // Load scanner settings from NVS (called once at boot)
 void loadSettings() {
   prefs.begin("scout", true);  // true = read-only
-  enableWifiScan = prefs.getBool("wifi", true);
-  enableBleScan  = prefs.getBool("ble",  true);
+  enableWifiScan = prefs.getBool("wifi",      true);
+  enableBleScan  = prefs.getBool("ble",       true);
+  flockOnlyMode  = prefs.getBool("flockonly", false);
   prefs.end();
-  consolePrintf("Settings loaded: WiFi=%s, BLE=%s\n",
-                enableWifiScan ? "ON" : "OFF", enableBleScan ? "ON" : "OFF");
+  consolePrintf("Settings loaded: WiFi=%s, BLE=%s, FlockOnly=%s\n",
+                enableWifiScan ? "ON" : "OFF",
+                enableBleScan  ? "ON" : "OFF",
+                flockOnlyMode  ? "ON" : "OFF");
 }
 
 // Save scanner settings to NVS (called when user changes a toggle)
 void saveSettings() {
   prefs.begin("scout", false);  // false = read-write
-  prefs.putBool("wifi", enableWifiScan);
-  prefs.putBool("ble",  enableBleScan);
+  prefs.putBool("wifi",      enableWifiScan);
+  prefs.putBool("ble",       enableBleScan);
+  prefs.putBool("flockonly", flockOnlyMode);
   prefs.end();
 }
 
@@ -963,7 +968,7 @@ void loop() {
       } else {
         // Paused / settings menu: short tap advances cursor, long press activates
         if (holdDuration < SHARE_HOLD_TIME) {
-          pauseMenuCursor = (pauseMenuCursor + 1) % 3;
+          pauseMenuCursor = (pauseMenuCursor + 1) % 4;
         } else {
           activatePauseMenuItem();
         }
@@ -1042,7 +1047,12 @@ void activatePauseMenuItem() {
       saveSettings();
       consolePrintf("BLE scanning %s\n", enableBleScan ? "enabled" : "disabled");
       break;
-    case 2:  // Resume
+    case 2:  // Toggle Flock Only
+      flockOnlyMode = !flockOnlyMode;
+      saveSettings();
+      consolePrintf("Flock-only mode %s\n", flockOnlyMode ? "enabled" : "disabled");
+      break;
+    case 3:  // Resume
       resumeScanning();
       break;
   }
@@ -1057,28 +1067,38 @@ void updateDisplayPaused() {
   display.println("== PAUSED / SETTINGS ==");
 
   // Menu item 0: WiFi toggle
-  display.setCursor(2, 13);
+  display.setCursor(2, 11);
   if (pauseMenuCursor == 0) {
     display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);  // Inverted = selected
-    display.printf(" WiFi: %-3s ", enableWifiScan ? "ON" : "OFF");
+    display.printf(" WiFi:  %-3s ", enableWifiScan ? "ON" : "OFF");
     display.setTextColor(SSD1306_WHITE);
   } else {
-    display.printf("  WiFi: %-3s ", enableWifiScan ? "ON" : "OFF");
+    display.printf("  WiFi:  %-3s ", enableWifiScan ? "ON" : "OFF");
   }
 
   // Menu item 1: BLE toggle
-  display.setCursor(2, 25);
+  display.setCursor(2, 21);
   if (pauseMenuCursor == 1) {
     display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
-    display.printf(" BLE:  %-3s ", enableBleScan ? "ON" : "OFF");
+    display.printf(" BLE:   %-3s ", enableBleScan ? "ON" : "OFF");
     display.setTextColor(SSD1306_WHITE);
   } else {
-    display.printf("  BLE:  %-3s ", enableBleScan ? "ON" : "OFF");
+    display.printf("  BLE:   %-3s ", enableBleScan ? "ON" : "OFF");
   }
 
-  // Menu item 2: Resume
-  display.setCursor(2, 37);
+  // Menu item 2: Flock Only toggle
+  display.setCursor(2, 31);
   if (pauseMenuCursor == 2) {
+    display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+    display.printf(" Flock: %-3s ", flockOnlyMode ? "ON" : "OFF");
+    display.setTextColor(SSD1306_WHITE);
+  } else {
+    display.printf("  Flock: %-3s ", flockOnlyMode ? "ON" : "OFF");
+  }
+
+  // Menu item 3: Resume
+  display.setCursor(2, 41);
+  if (pauseMenuCursor == 3) {
     display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
     display.print(" Resume Scan ");
     display.setTextColor(SSD1306_WHITE);
@@ -1087,8 +1107,8 @@ void updateDisplayPaused() {
   }
 
   // Hint at bottom
-  display.setCursor(2, 54);
-  display.print("Tap=next  Hold=select");
+  display.setCursor(2, 56);
+  display.print("Tap=next  Hold=sel");
 
   display.display();
 }
@@ -1850,6 +1870,7 @@ String getAuthModeString(wifi_auth_mode_t authMode) {
 
 // --- Flock Safety Device Detection ---
 // Signatures sourced from github.com/MaxwellDPS/Flock-You-Android
+// and github.com/justcallmekoko/ESP32Marauder
 
 static bool startsWithCI(const char* str, const char* prefix) {
   return strncasecmp(str, prefix, strlen(prefix)) == 0;
@@ -1858,33 +1879,48 @@ static bool startsWithCI(const char* str, const char* prefix) {
 // Returns true if WiFi AP matches Flock Safety signatures (SSID or OUI)
 bool isFlockWiFi(const char* ssid, uint8_t* bssid) {
   // SSID patterns (case-insensitive prefix match)
-  if (startsWithCI(ssid, "flock"))   return true;
-  if (startsWithCI(ssid, "fs-"))     return true;
-  if (startsWithCI(ssid, "fs_"))     return true;
-  if (startsWithCI(ssid, "falcon"))  return true;
-  if (startsWithCI(ssid, "sparrow")) return true;
-  if (startsWithCI(ssid, "condor"))  return true;
+  if (startsWithCI(ssid, "flock"))        return true;
+  if (startsWithCI(ssid, "fs-"))          return true;
+  if (startsWithCI(ssid, "fs_"))          return true;
+  if (startsWithCI(ssid, "falcon"))       return true;
+  if (startsWithCI(ssid, "sparrow"))      return true;
+  if (startsWithCI(ssid, "condor"))       return true;
+  if (startsWithCI(ssid, "penguin"))      return true;   // Flock external battery AP
+  if (startsWithCI(ssid, "pigvision"))    return true;   // Flock camera firmware variant
+  if (startsWithCI(ssid, "fs ext batt")) return true;   // "FS Ext Battery" AP name
   // Quectel LTE modem OUI (primary Flock modem manufacturer)
   if (bssid[0]==0x50 && bssid[1]==0x29 && bssid[2]==0x4D) return true;
   if (bssid[0]==0x86 && bssid[1]==0x25 && bssid[2]==0x19) return true;
   // Telit LTE modem OUI (alternate Flock modem)
   if (bssid[0]==0x00 && bssid[1]==0x14 && bssid[2]==0x2D) return true;
   if (bssid[0]==0xD8 && bssid[1]==0xC7 && bssid[2]==0x71) return true;
+  // OUI registered directly to Flock Safety
+  if (bssid[0]==0xB4 && bssid[1]==0x1E && bssid[2]==0x52) return true;
   return false;
 }
 
-// Returns true if BLE device matches Flock Safety signatures (name or Raven service UUID)
-bool isFlockBLE(const char* name, const char* serviceUUID) {
+// Returns true if BLE device matches Flock Safety signatures (name, service UUID, or manufacturer data)
+// manufDataHex: hex string of raw manufacturer data bytes (first 2 bytes = company ID, little-endian)
+bool isFlockBLE(const char* name, const char* serviceUUID, const char* manufDataHex) {
   // BLE name patterns (case-insensitive prefix match)
-  if (startsWithCI(name, "flock"))  return true;
-  if (startsWithCI(name, "falcon")) return true;
-  if (startsWithCI(name, "raven"))  return true;  // Raven acoustic sensor (Flock/SoundThinking)
-  // Raven custom BLE service UUIDs
+  if (startsWithCI(name, "flock"))        return true;
+  if (startsWithCI(name, "falcon"))       return true;
+  if (startsWithCI(name, "raven"))        return true;  // Raven acoustic sensor
+  if (startsWithCI(name, "penguin-"))     return true;  // Flock Penguin external battery (old firmware)
+  if (startsWithCI(name, "fs ext batt")) return true;  // Flock external battery (legacy name)
+  if (startsWithCI(name, "soundthinking")) return true; // SoundThinking (parent company) rebranding
+  if (startsWithCI(name, "shotspotter"))  return true;  // ShotSpotter acoustic sensor (SoundThinking)
+  // Raven custom BLE service UUIDs (firmware 1.2.x+)
   if (serviceUUID && strstr(serviceUUID, "00003100") != NULL) return true;  // GPS Location
   if (serviceUUID && strstr(serviceUUID, "00003200") != NULL) return true;  // Power Management
   if (serviceUUID && strstr(serviceUUID, "00003300") != NULL) return true;  // Network Status
   if (serviceUUID && strstr(serviceUUID, "00003400") != NULL) return true;  // Upload Statistics
   if (serviceUUID && strstr(serviceUUID, "00003500") != NULL) return true;  // Error/Diagnostics
+  // Legacy Raven BLE service UUIDs (firmware 1.1.x)
+  if (serviceUUID && strstr(serviceUUID, "00001809") != NULL) return true;  // Health Thermometer profile
+  if (serviceUUID && strstr(serviceUUID, "00001819") != NULL) return true;  // Location/Navigation profile
+  // Xuntong company ID 0x09C8 (LE bytes: C8 09) — Flock Penguin ODM manufacturer
+  if (manufDataHex && startsWithCI(manufDataHex, "C809")) return true;
   return false;
 }
 
@@ -1963,6 +1999,9 @@ bool scanWiFi() {
     // Flock Safety detection
     bool isFlock = isFlockWiFi(ssid.c_str(), ap->bssid);
     if (isFlock) flockLastSeenMs = millis();
+
+    // In Flock-only mode, skip all non-Flock devices entirely
+    if (flockOnlyMode && !isFlock) continue;
 
     // Track unique devices by BSSID (with mutex protection)
     if (xSemaphoreTake(deviceMapMutex, portMAX_DELAY) == pdTRUE) {
@@ -2078,9 +2117,12 @@ void scanBluetooth() {
       serviceUUID = device.getServiceUUID().toString().c_str();
     }
 
-    // Flock Safety detection (full name + UUID check)
-    bool isFlock = isFlockBLE(name.c_str(), serviceUUID.c_str());
+    // Flock Safety detection (full name + UUID + manufacturer data check)
+    bool isFlock = isFlockBLE(name.c_str(), serviceUUID.c_str(), manufData.c_str());
     if (isFlock) flockLastSeenMs = millis();
+
+    // In Flock-only mode, skip all non-Flock devices entirely
+    if (flockOnlyMode && !isFlock) continue;
 
     // Track unique devices by address (with mutex protection)
     if (xSemaphoreTake(deviceMapMutex, portMAX_DELAY) == pdTRUE) {
@@ -2327,28 +2369,35 @@ void updateDisplay(String statusMessage) {
     int wifi_total = cached_wifi_total;
     int ble_total = cached_ble_total;
 
-    // WiFi count: Last scan (Total) - add asterisk when scanning
+    // WiFi count: Last scan (Total) - add asterisk when scanning, "--" when disabled
     display.setCursor(2, 22);
-    if (wifiScanning) {
+    if (!enableWifiScan) {
+      display.print("W:--");
+    } else if (wifiScanning) {
       display.printf("W:%d(%d)*", wifi_last, wifi_total);
     } else {
       display.printf("W:%d(%d)", wifi_last, wifi_total);
     }
 
-    // BLE count: Last scan (Total) - add asterisk when scanning
+    // BLE count: Last scan (Total) - add asterisk when scanning, "--" when disabled
     display.setCursor(2, 34);
-    if (bleScanning) {
+    if (!enableBleScan) {
+      display.print("B:--");
+    } else if (bleScanning) {
       display.printf("B:%d(%d)*", ble_last, ble_total);
     } else {
       display.printf("B:%d(%d)", ble_last, ble_total);
     }
 
-    // Flock Safety alert - inverted text at y=46 when any Flock device detected
+    // Flock row at y=46: inverted count when devices seen; plain mode label when flock-only active
     if (cached_flock_total > 0) {
       display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);  // Inverted: alert style
       display.setCursor(2, 46);
       display.printf("FLOCK:%d", cached_flock_total);
       display.setTextColor(SSD1306_WHITE);  // Reset
+    } else if (flockOnlyMode) {
+      display.setCursor(2, 46);
+      display.print("[FLOCK ONLY]");
     }
 
     // Draw animated WiFi logo in center-right of screen
