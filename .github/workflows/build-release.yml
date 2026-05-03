@@ -56,7 +56,7 @@ jobs:
       # credentials are needed or embedded in CI builds.
       - name: Create placeholder secrets.h
         run: |
-          cat > SignalScout/secrets.h << 'EOF'
+          cat > secrets.h << 'EOF'
           #ifndef SECRETS_H
           #define SECRETS_H
           const char* WIFI_SSID     = "";
@@ -65,6 +65,7 @@ jobs:
           EOF
 
       # ── Compile ───────────────────────────────────────────────────────────
+      # The repo root is the sketch directory (SignalScout.ino lives here).
       # Board: ESP32-C5 (16 MB flash, 8 MB PSRAM).
       # Adjust FlashSize / PSRAM options if your hardware differs.
       - name: Compile sketch
@@ -73,7 +74,7 @@ jobs:
             --fqbn "esp32:esp32:esp32c5:FlashSize=16M,PartitionScheme=default,PSRAM=enabled" \
             --export-binaries \
             --output-dir build \
-            SignalScout
+            .
 
       - name: List build output
         run: ls -lh build/
