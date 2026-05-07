@@ -421,6 +421,7 @@ bool generateLogFileName() {
 void unifiedScanTask(void* parameter) {
   consolePrintln("[Scan Task] Unified scanner started");
   int wifiFailCount = 0;
+  int wifiZeroApCount = 0;  // consecutive zero-AP cycles (silently failing driver)
   unsigned long lastWifiDriverReset = millis();
 
   while (true) {
@@ -452,8 +453,6 @@ void unifiedScanTask(void* parameter) {
         consolePrintln("[WiFi] Proactive reset complete");
       }
 
-      // Clear any leftover scan data from a previous cycle before changing mode
-      esp_wifi_clear_ap_list();
       WiFi.disconnect(true);
       WiFi.mode(WIFI_OFF);
       delay(300);
@@ -461,6 +460,8 @@ void unifiedScanTask(void* parameter) {
       bool wifiReady = false;
       for (int attempt = 0; attempt < 3 && !wifiReady; attempt++) {
         if (WiFi.mode(WIFI_STA)) {
+          // Clear stale AP list now that the driver is actually running
+          esp_wifi_clear_ap_list();
           wifiReady = true;
         } else {
           consolePrintf("[WiFi] mode set failed (attempt %d/3), retrying...\n", attempt + 1);
@@ -480,8 +481,20 @@ void unifiedScanTask(void* parameter) {
 
         if (scanOk) {
           wifiFailCount = 0;
+          if (lastWiFiScanCount > 0) {
+            wifiZeroApCount = 0;
+          } else {
+            // Scan succeeded but returned 0 APs — could be a silently broken driver
+            wifiZeroApCount++;
+            if (wifiZeroApCount >= 5) {
+              consolePrintf("[WiFi] %d consecutive zero-AP scans — likely silent driver failure, forcing recovery\n", wifiZeroApCount);
+              wifiFailCount = 3;  // trigger deep reset on next check
+              wifiZeroApCount = 0;
+            }
+          }
         } else {
           wifiFailCount++;
+          wifiZeroApCount = 0;
           consolePrintf("[WiFi] Scan failed (consecutive failures: %d)\n", wifiFailCount);
         }
 
@@ -517,20 +530,23 @@ void unifiedScanTask(void* parameter) {
         pBLEScan->setAdvertisedDeviceCallbacks(&bleCallbacks, false);
         pBLEScan->setActiveScan(true);
         pBLEScan->setInterval(100);
-        pBLEScan->setWindow(99);
+        pBLEScan->setWindow(50);  // 50% duty cycle — leaves room for coexistence arbiter
       } else if (pBLEScan == NULL) {
         pBLEScan = BLEDevice::getScan();
         pBLEScan->setAdvertisedDeviceCallbacks(&bleCallbacks, false);
         pBLEScan->setActiveScan(true);
         pBLEScan->setInterval(100);
-        pBLEScan->setWindow(99);
+        pBLEScan->setWindow(50);
       }
 
       bleScanning = true;
       scanBluetooth();
       bleScanning = false;
+      // Explicitly stop before clearResults — the blocking start() completes but the
+      // BLE GAP state machine can linger and block WiFi radio acquisition next cycle.
+      pBLEScan->stop();
       pBLEScan->clearResults();
-      delay(200);
+      delay(500);  // Give the radio time to fully release after BLE
     } else if (BLEDevice::getInitialized()) {
       // User disabled BLE via settings - release the stack
       consolePrintln("[BLE] Disabled - releasing stack...");

@@ -67,10 +67,11 @@ The sketch uses FreeRTOS tasks for concurrent execution on the ESP32-C5's single
 - **Mutexes**: Protect shared resources (device maps, SD card access, display)
 - **Queue System**: Non-blocking log entry queue (50 entries) prevents SD card write conflicts
 - **Sequential Scanning**: WiFi and BLE scans run back-to-back within a single unified task. The ESP32-C5 hardware coexistence arbiter handles radio sharing automatically — BLE is initialized once and kept alive across cycles (NOT deinit/reinit per cycle, which corrupted radio state after 3-5 cycles):
-  - WiFi: Runs first (~3 seconds); `esp_wifi_clear_ap_list()` called before each cycle to flush stale state
-  - BLE: Runs after WiFi completes (~3 seconds); `pBLEScan->clearResults()` called after each scan
+  - WiFi: Runs first (~3 seconds); `esp_wifi_clear_ap_list()` called after `WIFI_STA` mode is confirmed active (NOT before, when driver is off)
+  - BLE: Runs after WiFi completes (~3 seconds); `pBLEScan->stop()` called explicitly after the blocking `start()` returns, then `pBLEScan->clearResults()`, then 500ms delay to let the radio fully release
+  - BLE scan duty cycle: interval=100ms, window=50ms (50%) — leaving 50% radio time for coexistence arbiter (previously 99%, which starved the arbiter)
   - Cycle repeats every 10 seconds
-- **WiFi Failure Recovery**: consecutive WiFi scan failures are tracked; after 3 failures a deep `esp_wifi_stop()` + `esp_wifi_start()` reset is performed automatically
+- **WiFi Failure Recovery**: consecutive WiFi scan failures are tracked; after 3 failures a deep `esp_wifi_stop()` + `esp_wifi_start()` reset is performed automatically. Zero-AP results (silent driver failure) are also tracked — 5 consecutive zero-AP scans force recovery the same way.
 - **Proactive WiFi Driver Reset**: regardless of failure state, the driver is fully reset every `WIFI_DRIVER_RESET_INTERVAL_MS` (default 5 minutes) to prevent silent degradation that causes scans to stop working after long sessions. This reset runs before the scan setup in each cycle when the interval has elapsed. Adjust the `#define` if degradation occurs sooner.
 
 The sketch is structured around four main components:
