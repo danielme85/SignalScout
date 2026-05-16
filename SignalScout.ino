@@ -4,7 +4,7 @@
  * Logs all activity to SD card over SPI with GPS timestamps and location
  * Displays status on SSD1309 OLED display
  *
- * Hardware: ESP32-C5 (16MB FLASH, 8MB PSRAM)
+ * Hardware: ESP32-C5 (16MB FLASH, 8MB PSRAM) or Seeed XIAO ESP32-C5 (8MB FLASH, 8MB PSRAM)
  * SD Card: Connected via SPI
  * GPS: NEO-6M connected via UART (TX/RX)
  * OLED: SSD1309 128x64 connected via SPI
@@ -140,9 +140,12 @@ bool logFileReady = false;
 
 // Device tracking
 #include <map>
+#include <set>
 #include <string>
 std::map<std::string, bool> seenWiFiDevices;    // Track unique WiFi devices by BSSID
 std::map<std::string, bool> seenBLEDevices;     // Track unique BLE devices by address
+// Never cleared — keeps Flock dedup accurate even after WiFi/BLE maps are evicted
+std::set<std::string> seenFlockKeys;
 int uniqueWiFiCount = 0;
 int uniqueBLECount = 0;
 int uniqueFlockCount = 0;
@@ -413,10 +416,13 @@ bool generateLogFileName() {
 // cycles — the ESP32-C5 hardware coexistence arbiter handles radio sharing automatically.
 // Repeatedly calling BLEDevice::init()/deinit() every cycle corrupts radio state after
 // 3-5 cycles, which is what was causing WiFi to hang. Keeping BLE initialized avoids this.
-// Proactive WiFi driver reset interval (ms). The driver silently degrades over long
-// sessions even when scans appear to succeed. Resetting every 5 minutes prevents the
-// 10-minute degradation without being frequent enough to noticeably interrupt scanning.
-#define WIFI_DRIVER_RESET_INTERVAL_MS (5UL * 60UL * 1000UL)
+// Proactive WiFi mode reset interval (ms).
+// Uses WiFi.mode() APIs only — NEVER call esp_wifi_start() inside this reset without
+// immediately setting a mode. The normal scan setup always calls WiFi.mode(WIFI_OFF) right
+// after the proactive block; if esp_wifi_start() was called here, that becomes a
+// start→stop→start chain that corrupts the ESP32-C5 radio and is the root cause of WiFi
+// dying at the ~5-minute mark. 15 minutes avoids constant churn while still refreshing state.
+#define WIFI_DRIVER_RESET_INTERVAL_MS (15UL * 60UL * 1000UL)
 
 void unifiedScanTask(void* parameter) {
   consolePrintln("[Scan Task] Unified scanner started");
@@ -437,17 +443,15 @@ void unifiedScanTask(void* parameter) {
     if (enableWifiScan) {
       consolePrintln("\n[WiFi] Initializing radio...");
 
-      // Proactive deep reset every WIFI_DRIVER_RESET_INTERVAL_MS to prevent silent driver
-      // degradation. This runs before the scan setup so the driver starts each window fresh.
+      // Proactive mode reset: clear stale WiFi state using WiFi.mode() APIs only.
+      // Do NOT call esp_wifi_start() here — the normal scan setup below calls
+      // WiFi.mode(WIFI_OFF) immediately after, turning start→stop→start into a
+      // start→stop→stop→start chain that corrupts the ESP32-C5 radio arbiter.
       if (millis() - lastWifiDriverReset >= WIFI_DRIVER_RESET_INTERVAL_MS) {
         consolePrintln("[WiFi] Scheduled proactive driver reset...");
         WiFi.disconnect(true);
         WiFi.mode(WIFI_OFF);
-        delay(300);
-        esp_wifi_stop();
-        delay(500);
-        esp_wifi_start();
-        delay(500);
+        delay(500);  // Let driver fully stop before normal scan setup takes over
         wifiFailCount = 0;
         lastWifiDriverReset = millis();
         consolePrintln("[WiFi] Proactive reset complete");
@@ -504,12 +508,17 @@ void unifiedScanTask(void* parameter) {
         delay(300);
       }
 
-      // Deep recovery after repeated failures: force full ESP-IDF WiFi driver reset
+      // Deep recovery after repeated failures: force full ESP-IDF WiFi driver stop.
+      // Do NOT call esp_wifi_start() here — WiFi.mode(WIFI_STA) in the next cycle's
+      // retry loop will call it properly with a mode set. Calling start() here without
+      // a mode leaves the driver in an indeterminate state and the subsequent
+      // WiFi.mode(WIFI_OFF) immediately stops it again, corrupting radio state.
       if (wifiFailCount >= 3) {
         consolePrintln("[WiFi] Too many failures - deep radio reset...");
-        esp_wifi_stop();
-        delay(500);
-        esp_wifi_start();
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+        delay(200);
+        esp_wifi_stop();  // ESP-IDF level stop for stubborn driver state
         delay(500);
         wifiFailCount = 0;
         lastWifiDriverReset = millis();
@@ -806,16 +815,8 @@ void setup() {
   consolePrintln("\n[5b/7] Loading saved settings...");
   loadSettings();
 
-  // Initialize WiFi
-  consolePrintln("\n[6/7] Initializing WiFi...");
-  if (enableWifiScan) {
-    WiFi.mode(WIFI_STA);
-    WiFi.disconnect();
-    delay(100);
-    consolePrintln("WiFi initialized (dual-band 2.4GHz + 5GHz mode)");
-  } else {
-    consolePrintln("WiFi scanning disabled in config");
-  }
+  // WiFi initialized per-cycle by unifiedScanTask (not here — scan task owns the radio)
+  consolePrintln("\n[6/7] WiFi deferred to scan task");
 
   // Skip BLE initialization on boot - it will be initialized by the unified scan task
   consolePrintln("Skipping BLE init (will initialize when scan task starts)");
@@ -1136,6 +1137,23 @@ String formatFileSize(size_t size) {
   return String((float)size / (1024.0 * 1024.0), 1) + " MB";
 }
 
+// HTML-escape a filename for use in HTML attribute values and text content.
+// SD card filenames are firmware-generated and shouldn't contain these chars, but
+// defense-in-depth prevents XSS if someone physically inserts a crafted card.
+void htmlEscapeFilename(const char* src, char* dst, size_t dstSize) {
+  size_t out = 0;
+  for (size_t i = 0; src[i] && out + 7 < dstSize; i++) {
+    char c = src[i];
+    if      (c == '<')  { memcpy(dst + out, "&lt;",   4); out += 4; }
+    else if (c == '>')  { memcpy(dst + out, "&gt;",   4); out += 4; }
+    else if (c == '&')  { memcpy(dst + out, "&amp;",  5); out += 5; }
+    else if (c == '"')  { memcpy(dst + out, "&quot;", 6); out += 6; }
+    else if (c == '\'') { memcpy(dst + out, "&#39;",  5); out += 5; }
+    else                { dst[out++] = c; }
+  }
+  dst[out] = '\0';
+}
+
 // Files per page in web file browser
 #define FILES_PER_PAGE 20
 
@@ -1322,12 +1340,14 @@ void configureServerRoutes() {
                              tm->tm_hour, tm->tm_min);
                   }
                 }
+                char fnameEsc[128];
+                htmlEscapeFilename(fname, fnameEsc, sizeof(fnameEsc));
                 snprintf(rowBuf, sizeof(rowBuf),
                          "<tr><td><a href=\"/download?name=%s\">%s</a></td>"
                          "<td class=\"dt\">%s</td>"
                          "<td class=\"sz\">%s</td>"
                          "<td><button class=\"del\" onclick=\"delFile('%s')\">Delete</button></td></tr>",
-                         fname, fname, dateBuf, sizeStr.c_str(), fname);
+                         fnameEsc, fnameEsc, dateBuf, sizeStr.c_str(), fnameEsc);
                 response->print(rowBuf);
                 filesShown++;
               } else if (fileIndex >= skipCount + FILES_PER_PAGE) {
@@ -1472,7 +1492,7 @@ void configureServerRoutes() {
       return;
     }
     String filename = request->getParam("name")->value();
-    if (filename.indexOf("..") >= 0) {
+    if (filename.indexOf("..") >= 0 || filename.indexOf("/") >= 0) {
       request->send(400, "text/plain", "Invalid filename");
       return;
     }
@@ -1516,9 +1536,11 @@ void configureServerRoutes() {
       String names[MAX_BATCH];
       int count = 0;
 
-      // Process in batches to limit memory usage
+      // Process in batches to limit memory usage. Cap at 100 batches to prevent
+      // an infinite loop if a file can't be deleted (e.g. SD write-protected).
       bool moreFiles = true;
-      while (moreFiles) {
+      int batchLimit = 100;
+      while (moreFiles && batchLimit-- > 0) {
         count = 0;
         root.rewindDirectory();
         // Skip already-processed files by scanning past deleted ones
@@ -1805,25 +1827,23 @@ void startScanTasks() {
 
   // Unified Scan Task - handles WiFi and BLE sequentially
   // Always create the task; it reads enableWifiScan/enableBleScan at runtime each cycle
-  if (true) {
-    if (unifiedScanTaskHandle == NULL) {
-      BaseType_t result = xTaskCreate(
-        unifiedScanTask,       // Task function
-        "Unified Scanner",     // Task name
-        20480,                 // Stack size - BLE library needs significant stack space
-        NULL,                  // Parameters
-        1,                     // Priority
-        &unifiedScanTaskHandle // Task handle
-      );
-      if (result != pdPASS) {
-        consolePrintln("ERROR: Failed to create Unified Scanner task!");
-      } else {
-        consolePrintln("Unified Scanner task created (WiFi->BLE sequential)");
-      }
+  if (unifiedScanTaskHandle == NULL) {
+    BaseType_t result = xTaskCreate(
+      unifiedScanTask,       // Task function
+      "Unified Scanner",     // Task name
+      20480,                 // Stack size - BLE library needs significant stack space
+      NULL,                  // Parameters
+      1,                     // Priority
+      &unifiedScanTaskHandle // Task handle
+    );
+    if (result != pdPASS) {
+      consolePrintln("ERROR: Failed to create Unified Scanner task!");
     } else {
-      vTaskResume(unifiedScanTaskHandle);
-      consolePrintln("Unified Scanner task resumed");
+      consolePrintln("Unified Scanner task created (WiFi->BLE sequential)");
     }
+  } else {
+    vTaskResume(unifiedScanTaskHandle);
+    consolePrintln("Unified Scanner task resumed");
   }
 
   ledReady();  // Green: Ready
@@ -2030,10 +2050,12 @@ bool scanWiFi() {
       if (seenWiFiDevices.find(bssidKey) == seenWiFiDevices.end()) {
         seenWiFiDevices[bssidKey] = true;
         uniqueWiFiCount++;
-        if (isFlock) {
-          uniqueFlockCount++;
-          flockAlertUntilMs = millis() + 3000;
-        }
+      }
+      // Flock dedup uses a separate never-cleared set so map eviction doesn't re-trigger alerts
+      if (isFlock && seenFlockKeys.find(bssidKey) == seenFlockKeys.end()) {
+        seenFlockKeys.insert(bssidKey);
+        uniqueFlockCount++;
+        flockAlertUntilMs = millis() + 3000;
       }
       xSemaphoreGive(deviceMapMutex);
     }
@@ -2151,10 +2173,12 @@ void scanBluetooth() {
       if (seenBLEDevices.find(addrKey) == seenBLEDevices.end()) {
         seenBLEDevices[addrKey] = true;
         uniqueBLECount++;
-        if (isFlock) {
-          uniqueFlockCount++;
-          flockAlertUntilMs = millis() + 3000;
-        }
+      }
+      // Flock dedup uses a separate never-cleared set so map eviction doesn't re-trigger alerts
+      if (isFlock && seenFlockKeys.find(addrKey) == seenFlockKeys.end()) {
+        seenFlockKeys.insert(addrKey);
+        uniqueFlockCount++;
+        flockAlertUntilMs = millis() + 3000;
       }
       xSemaphoreGive(deviceMapMutex);
     }
@@ -2211,7 +2235,6 @@ void scanBluetooth() {
     }
   }
 
-  pBLEScan->clearResults();
   consolePrintln("--- Bluetooth Scan Complete ---\n");
 }
 
@@ -2604,7 +2627,7 @@ void drawWiFiLogo(int x, int y) {
     int r = ringRadii[ring];
     // Draw arc from -50 to +50 degrees
     for (int angle = -55; angle <= 55; angle += 2) {
-      float rad = angle * 3.14159 / 180.0;
+      float rad = angle * PI / 180.0;
       int px = cx + (int)(r * sin(rad));
       int py = cy - (int)(r * cos(rad));
       display.drawPixel(px, py, SSD1306_WHITE);

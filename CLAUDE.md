@@ -25,7 +25,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Power off when done; boot normally (button released) to return to scan mode
 
 Hardware requirements:
-- ESP32-C5 board (16MB FLASH, 8MB PSRAM)
+- ESP32-C5 board (16MB FLASH, 8MB PSRAM) **or** Seeed Studio XIAO ESP32-C5 (8MB FLASH, 8MB PSRAM — use the `xiao-esp32c5-8mb` CI artifact)
 - SD card module connected via SPI
 - NEO-6M GPS module connected via UART (TX/RX)
 - SSD1309 OLED display 128x64 connected via SPI
@@ -40,7 +40,9 @@ This is an Arduino sketch (.ino file) that should be developed using:
 - Arduino CLI, or
 - PlatformIO
 
-**CI/CD:** GitHub Actions (`.github/workflows/build-release.yml`) compiles the sketch on every `v*` tag push using arduino-cli + the ESP32 core, then creates a GitHub Release with the compiled binaries attached. Push a tag (`git tag vX.Y.Z && git push origin vX.Y.Z`) to trigger a release. `workflow_dispatch` allows manual test builds without tagging. The workflow creates a stub `secrets.h` at compile time (empty credentials) — the gitignored real file is never committed or embedded in releases.
+**CI/CD:** GitHub Actions (`.github/workflows/build-release.yml`) compiles the sketch on every `v*` tag push using arduino-cli + the ESP32 core, then creates a GitHub Release with the compiled binaries attached. Push a tag (`git tag vX.Y.Z && git push origin vX.Y.Z`) to trigger a release. `workflow_dispatch` allows manual test builds without tagging. The workflow creates a stub `secrets.h` at compile time (empty credentials) — the gitignored real file is never committed or embedded in releases. Two build targets use a matrix strategy:
+- `esp32c5-16mb` — standard ESP32-C5 dev board (16MB flash, PSRAM enabled)
+- `xiao-esp32c5-8mb` — Seeed XIAO ESP32-C5 (8MB flash, PSRAM disabled)
 
 ## File Structure
 
@@ -64,15 +66,15 @@ The sketch uses FreeRTOS tasks for concurrent execution on the ESP32-C5's single
 - Higher priority tasks preempt lower priority tasks when ready to run
 
 **Thread Safety & Radio Sequencing:**
-- **Mutexes**: Protect shared resources (device maps, SD card access, display)
+- **Mutexes**: Protect shared resources (device maps including `seenFlockKeys`, SD card access, display)
 - **Queue System**: Non-blocking log entry queue (50 entries) prevents SD card write conflicts
 - **Sequential Scanning**: WiFi and BLE scans run back-to-back within a single unified task. The ESP32-C5 hardware coexistence arbiter handles radio sharing automatically — BLE is initialized once and kept alive across cycles (NOT deinit/reinit per cycle, which corrupted radio state after 3-5 cycles):
   - WiFi: Runs first (~3 seconds); `esp_wifi_clear_ap_list()` called after `WIFI_STA` mode is confirmed active (NOT before, when driver is off)
   - BLE: Runs after WiFi completes (~3 seconds); `pBLEScan->stop()` called explicitly after the blocking `start()` returns, then `pBLEScan->clearResults()`, then 500ms delay to let the radio fully release
   - BLE scan duty cycle: interval=100ms, window=50ms (50%) — leaving 50% radio time for coexistence arbiter (previously 99%, which starved the arbiter)
   - Cycle repeats every 10 seconds
-- **WiFi Failure Recovery**: consecutive WiFi scan failures are tracked; after 3 failures a deep `esp_wifi_stop()` + `esp_wifi_start()` reset is performed automatically. Zero-AP results (silent driver failure) are also tracked — 5 consecutive zero-AP scans force recovery the same way.
-- **Proactive WiFi Driver Reset**: regardless of failure state, the driver is fully reset every `WIFI_DRIVER_RESET_INTERVAL_MS` (default 5 minutes) to prevent silent degradation that causes scans to stop working after long sessions. This reset runs before the scan setup in each cycle when the interval has elapsed. Adjust the `#define` if degradation occurs sooner.
+- **WiFi Failure Recovery**: consecutive WiFi scan failures are tracked; after 3 failures a deep `WiFi.mode(WIFI_OFF)` + `esp_wifi_stop()` reset is performed. Zero-AP results (silent driver failure) are also tracked — 5 consecutive zero-AP scans force recovery the same way. **Critical**: neither recovery path calls `esp_wifi_start()` directly — `WiFi.mode(WIFI_STA)` in the retry loop handles that. Calling `esp_wifi_start()` here and then `WiFi.mode(WIFI_OFF)` immediately after creates a start→stop→start→stop chain that corrupts the ESP32-C5 radio arbiter.
+- **Proactive WiFi Mode Reset**: regardless of failure state, a `WiFi.mode(WIFI_OFF)` reset is run every `WIFI_DRIVER_RESET_INTERVAL_MS` (default 15 minutes). Uses only `WiFi.mode()` APIs — never `esp_wifi_start()` — for the same reason above. Increase the interval if issues appear sooner; do not reduce below 10 minutes.
 
 The sketch is structured around four main components:
 
@@ -131,8 +133,8 @@ The sketch is structured around four main components:
    - BLE manufacturer data: Xuntong company ID `0x09C8` (hex prefix `C809`) — Penguin battery ODM chip
    - `isFlockBLE()` takes three args: `name`, `serviceUUID`, `manufDataHex`
    - Detected devices are logged as `FLOCK-WIFI` or `FLOCK-BLE` (instead of `WIFI`/`BLE`) in the log file
-   - `uniqueFlockCount` tracked separately from WiFi/BLE counts
-   - On new detection: sets `flockAlertUntilMs = millis() + 3000` to trigger full-screen blinking display alert
+   - `uniqueFlockCount` tracked separately from WiFi/BLE counts; deduplication uses `seenFlockKeys` (`std::set`), a **never-cleared** set independent of the WiFi/BLE maps — prevents re-counting and re-alerting after map eviction
+   - On first detection of a new key: sets `flockAlertUntilMs = millis() + 3000` to trigger full-screen blinking display alert
    - Display shows `FLOCK:N` in inverted text (black-on-white) persistently while `uniqueFlockCount > 0`
    - Display update interval drops to 250ms during Flock alert (instead of 1000ms) for smooth blinking
    - **Flock-only mode** (`flockOnlyMode` bool, NVS key `"flockonly"`): when true, non-Flock devices are skipped via `continue` immediately after detection check in both `scanWiFi()` and `scanBluetooth()` — nothing counted, logged, or displayed for non-Flock hits
