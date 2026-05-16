@@ -1924,14 +1924,55 @@ bool isFlockWiFi(const char* ssid, uint8_t* bssid) {
   if (startsWithCI(ssid, "penguin"))      return true;   // Flock external battery AP
   if (startsWithCI(ssid, "pigvision"))    return true;   // Flock camera firmware variant
   if (startsWithCI(ssid, "fs ext batt")) return true;   // "FS Ext Battery" AP name
-  // Quectel LTE modem OUI (primary Flock modem manufacturer)
-  if (bssid[0]==0x50 && bssid[1]==0x29 && bssid[2]==0x4D) return true;
-  if (bssid[0]==0x86 && bssid[1]==0x25 && bssid[2]==0x19) return true;
-  // Telit LTE modem OUI (alternate Flock modem)
-  if (bssid[0]==0x00 && bssid[1]==0x14 && bssid[2]==0x2D) return true;
-  if (bssid[0]==0xD8 && bssid[1]==0xC7 && bssid[2]==0x71) return true;
-  // OUI registered directly to Flock Safety
-  if (bssid[0]==0xB4 && bssid[1]==0x1E && bssid[2]==0x52) return true;
+
+  // OUI lookup — inline byte comparison is faster than a loop on embedded hardware.
+  // Sources: colonelpanichacks/flock-you (31 field-verified OUIs), MaxwellDPS/Flock-You-Android,
+  //          justcallmekoko/ESP32Marauder, and FCC filings.
+  uint8_t b0=bssid[0], b1=bssid[1], b2=bssid[2];
+
+  // --- colonelpanichacks/flock-you field-verified OUI list (31 entries) ---
+  if (b0==0x70 && b1==0xC9 && b2==0x4E) return true;
+  if (b0==0x3C && b1==0x91 && b2==0x80) return true;
+  if (b0==0xD8 && b1==0xF3 && b2==0xBC) return true;
+  if (b0==0x80 && b1==0x30 && b2==0x49) return true;
+  if (b0==0xB8 && b1==0x35 && b2==0x32) return true;
+  if (b0==0x14 && b1==0x5A && b2==0xFC) return true;
+  if (b0==0x74 && b1==0x4C && b2==0xA1) return true;
+  if (b0==0x08 && b1==0x3A && b2==0x88) return true;
+  if (b0==0x9C && b1==0x2F && b2==0x9D) return true;
+  if (b0==0xC0 && b1==0x35 && b2==0x32) return true;
+  if (b0==0x94 && b1==0x08 && b2==0x53) return true;
+  if (b0==0xE4 && b1==0xAA && b2==0xEA) return true;
+  if (b0==0xF4 && b1==0x6A && b2==0xDD) return true;
+  if (b0==0xF8 && b1==0xA2 && b2==0xD6) return true;
+  if (b0==0x24 && b1==0xB2 && b2==0xB9) return true;
+  if (b0==0x00 && b1==0xF4 && b2==0x8D) return true;
+  if (b0==0xD0 && b1==0x39 && b2==0x57) return true;
+  if (b0==0xE8 && b1==0xD0 && b2==0xFC) return true;
+  if (b0==0xE0 && b1==0x4F && b2==0x43) return true;
+  if (b0==0xB8 && b1==0x1E && b2==0xA4) return true;
+  if (b0==0x70 && b1==0x08 && b2==0x94) return true;
+  if (b0==0x58 && b1==0x8E && b2==0x81) return true;
+  if (b0==0xEC && b1==0x1B && b2==0xBD) return true;
+  if (b0==0x3C && b1==0x71 && b2==0xBF) return true;
+  if (b0==0x58 && b1==0x00 && b2==0xE3) return true;
+  if (b0==0x90 && b1==0x35 && b2==0xEA) return true;
+  if (b0==0x5C && b1==0x93 && b2==0xA2) return true;
+  if (b0==0x64 && b1==0x6E && b2==0x69) return true;
+  if (b0==0x48 && b1==0x27 && b2==0xEA) return true;
+  if (b0==0xA4 && b1==0xCF && b2==0x12) return true;
+  if (b0==0x82 && b1==0x6B && b2==0xF2) return true;  // DeFlockJoplin field research
+
+  // --- Additional OUIs from MaxwellDPS/ESP32Marauder research ---
+  // Quectel LTE modem (primary Flock modem manufacturer)
+  if (b0==0x50 && b1==0x29 && b2==0x4D) return true;
+  if (b0==0x86 && b1==0x25 && b2==0x19) return true;
+  // Telit LTE modem (alternate Flock modem)
+  if (b0==0x00 && b1==0x14 && b2==0x2D) return true;
+  if (b0==0xD8 && b1==0xC7 && b2==0x71) return true;
+  // OUI registered directly to Flock Safety (FCC filing)
+  if (b0==0xB4 && b1==0x1E && b2==0x52) return true;
+
   return false;
 }
 
@@ -1942,7 +1983,8 @@ bool isFlockBLE(const char* name, const char* serviceUUID, const char* manufData
   if (startsWithCI(name, "flock"))        return true;
   if (startsWithCI(name, "falcon"))       return true;
   if (startsWithCI(name, "raven"))        return true;  // Raven acoustic sensor
-  if (startsWithCI(name, "penguin-"))     return true;  // Flock Penguin external battery (old firmware)
+  if (startsWithCI(name, "penguin"))      return true;  // Flock Penguin external battery (any variant)
+  if (startsWithCI(name, "pigvision"))   return true;  // Flock/Pigvision camera firmware
   if (startsWithCI(name, "fs ext batt")) return true;  // Flock external battery (legacy name)
   if (startsWithCI(name, "soundthinking")) return true; // SoundThinking (parent company) rebranding
   if (startsWithCI(name, "shotspotter"))  return true;  // ShotSpotter acoustic sensor (SoundThinking)

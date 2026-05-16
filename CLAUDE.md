@@ -127,8 +127,8 @@ The sketch is structured around four main components:
    - Identifies Flock Safety (SoundThinking) license plate readers, Penguin external batteries, and Raven acoustic sensors
    - Signatures sourced from `github.com/MaxwellDPS/Flock-You-Android` and `github.com/justcallmekoko/ESP32Marauder`
    - WiFi SSID prefixes: `flock`, `fs-`, `fs_`, `falcon`, `sparrow`, `condor`, `penguin`, `pigvision`, `fs ext batt`
-   - WiFi OUIs: Quectel (`50:29:4D`, `86:25:19`), Telit (`00:14:2D`, `D8:C7:71`), Flock Safety direct (`B4:1E:52`)
-   - BLE name prefixes: `flock`, `falcon`, `raven`, `penguin-`, `fs ext batt`, `soundthinking`, `shotspotter`
+   - WiFi OUIs: 36 total — 31 field-verified entries from colonelpanichacks/flock-you plus Quectel (`50:29:4D`, `86:25:19`), Telit (`00:14:2D`, `D8:C7:71`), and Flock Safety direct (`B4:1E:52`) from MaxwellDPS/ESP32Marauder research
+   - BLE name prefixes: `flock`, `falcon`, `raven`, `penguin` (any variant), `pigvision`, `fs ext batt`, `soundthinking`, `shotspotter`
    - BLE service UUIDs (firmware 1.2.x+): `0000310x`–`0000350x`; legacy (1.1.x): `00001809`, `00001819`
    - BLE manufacturer data: Xuntong company ID `0x09C8` (hex prefix `C809`) — Penguin battery ODM chip
    - `isFlockBLE()` takes three args: `name`, `serviceUUID`, `manufDataHex`

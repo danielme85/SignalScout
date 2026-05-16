@@ -278,18 +278,16 @@ const char* WIFI_PASSWORD = "YourNetworkPassword";
 
 SignalScout automatically identifies **Flock Safety** (now SoundThinking) license plate readers, Penguin external battery packs, and Raven acoustic gunshot sensors while scanning. These are fixed surveillance devices commonly found on utility poles and street furniture.
 
-Signatures are sourced from [MaxwellDPS/Flock-You-Android](https://github.com/MaxwellDPS/Flock-You-Android) and [justcallmekoko/ESP32Marauder](https://github.com/justcallmekoko/ESP32Marauder).
+Signatures are sourced from [colonelpanichacks/flock-you](https://github.com/colonelpanichacks/flock-you), [MaxwellDPS/Flock-You-Android](https://github.com/MaxwellDPS/Flock-You-Android), and [justcallmekoko/ESP32Marauder](https://github.com/justcallmekoko/ESP32Marauder).
 
 ### What It Detects
 
 **WiFi (via SSID prefix or hardware OUI):**
 - SSID prefixes: `flock`, `fs-`, `fs_`, `falcon`, `sparrow`, `condor`, `penguin`, `pigvision`, `fs ext batt`
-- Quectel LTE modem OUIs: `50:29:4D`, `86:25:19`
-- Telit LTE modem OUIs: `00:14:2D`, `D8:C7:71`
-- Flock Safety registered OUI: `B4:1E:52`
+- **36 hardware OUIs** — 31 field-verified entries from colonelpanichacks research plus Quectel (`50:29:4D`, `86:25:19`), Telit (`00:14:2D`, `D8:C7:71`), and Flock Safety direct (`B4:1E:52`)
 
 **BLE (via device name, service UUID, or manufacturer data):**
-- Device name prefixes: `flock`, `falcon`, `raven`, `penguin-`, `fs ext batt`, `soundthinking`, `shotspotter`
+- Device name prefixes: `flock`, `falcon`, `raven`, `penguin` (any variant), `pigvision`, `fs ext batt`, `soundthinking`, `shotspotter`
 - Raven service UUIDs (firmware 1.2.x+): `00003100` (GPS Location), `00003200` (Power Management), `00003300` (Network Status), `00003400` (Upload Statistics), `00003500` (Error/Diagnostics)
 - Legacy Raven service UUIDs (firmware 1.1.x): `00001809`, `00001819`
 - Xuntong manufacturer data (`C809` prefix) — identifies Flock Penguin external battery packs by ODM chip
