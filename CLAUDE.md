@@ -103,25 +103,23 @@ The sketch is structured around four main components:
    - Syncs ESP32 RTC from GPS time (updates every 60 seconds for accuracy)
    - RTC time persists across reboots, allowing immediate time availability on boot
 
-4. **OLED Display** (`updateDisplay()` function):
+4. **OLED Display** (`updateDisplay()` / `drawStatusBar()` functions):
    - Updates every 1 second with real-time GPS and system status
-   - **Top Left**: Satellite signal strength indicator with icon and bars (0-5 bars based on satellite count)
-   - **Top Center**: Battery indicator with icon showing charge level and percentage
-   - **Top Right**: Compass direction (N, NE, E, SE, S, SW, W, NW)
-   - **Center Left**: Device counts - WiFi "W:X(XX)", BLE "B:X(XX)"
-     - Asterisk (*) appears after count when actively scanning (e.g., "W:5(23)*")
-     - Shows last scan count and total unique devices seen
-     - `W:--` / `B:--` shown when that scanner is disabled
-   - **Flock Row** (below BLE count): one of three states:
-     - `FLOCK:N` inverted (black-on-white) — Flock devices detected this session
-     - `[FLOCK ONLY]` — flock-only mode active, no Flock devices found yet
-     - blank — normal mode, no Flock devices seen
-     - Full-screen blinking "GET FLOCKED!" alert fires for 3 seconds on first detection of each new Flock device
-     - Display update rate increases to 250ms during alert for smooth blinking, then returns to 1000ms
-   - **Center Right**: Animated WiFi logo
-   - **Bottom Left**: GPS time in HH:MM:SS UTC format (2px left margin, updates every second)
-   - **Bottom Right**: Speed in both MPH and KPH (2px right margin, right-aligned)
-   - All display elements use consistent 2px margins on left and right edges
+   - Rendered with the u8g2 library; settings menu uses MUI (Menu User Interface, bundled with u8g2)
+   - **Status Bar** (y=0-10, present on every screen — consistent mobile-phone-style layout):
+     - **Left**: 5 ascending signal bars (like phone signal strength) showing GPS satellite lock level, plus digit count ("7", "--" if invalid)
+     - **Centre**: Compass direction (N, NE, E, SE, S, SW, W, NW) — requires movement >1 km/h
+     - **Right**: Battery outline icon with fill level + percentage ("85%") right-aligned before the icon
+     - 1px separator line at y=11 divides status bar from content
+   - **Content area** (y=12 onwards):
+     - **WiFi row**: "W:X(XX)" — last scan count / total unique; asterisk when scanning; "W:--" when disabled
+     - **BLE row**: "B:X(XX)" — same format
+     - **Flock row**: `FLOCK:N` inverted badge when devices seen; `[FLOCK ONLY]` label when mode active
+     - Full-screen blinking "GET FLOCKED!" alert fires for 3 seconds on first detection of each new Flock device (no status bar during alert — maximum impact)
+     - Display update rate increases to 250ms during Flock alert, then returns to 1000ms
+     - **Right**: Animated WiFi logo (arcs radiate from centre dot)
+   - **Bottom bar**: GPS time HH:MM:SS (left) and speed in MPH/KPH (right)
+   - Display can be set to auto-off after inactivity (see `displayTimerIdx` setting)
 
 5. **Flock Safety Detection** (`isFlockWiFi()` / `isFlockBLE()` functions):
    - Identifies Flock Safety (SoundThinking) license plate readers, Penguin external batteries, and Raven acoustic sensors
@@ -182,12 +180,15 @@ The sketch is structured around four main components:
 
 Key settings defined at the top of the sketch:
 
-- **Scanner Flags** (runtime `bool` variables, persisted in NVS via `Preferences`):
-  - `enableWifiScan`: Enable/disable WiFi network scanning (default: true)
-  - `enableBleScan`: Enable/disable Bluetooth Low Energy scanning (default: true)
-  - `flockOnlyMode`: When true, non-Flock devices are silently ignored — not counted, not logged (default: false)
-  - These are changed at runtime via the pause/settings menu and survive reboots
-  - Previously these were compile-time `#define` constants; do NOT revert to defines
+- **Scanner Flags** (runtime variables, persisted in NVS via `Preferences`):
+  - `enableWifiScan` (bool, NVS `"wifi"`): Enable/disable WiFi network scanning (default: true)
+  - `enableBleScan` (bool, NVS `"ble"`): Enable/disable Bluetooth Low Energy scanning (default: true)
+  - `flockOnlyMode` (bool, NVS `"flockonly"`): When true, non-Flock devices are silently ignored (default: false)
+  - `displayTimerIdx` (uint8_t, NVS `"disptimer"`): Display off timer index — 0=OFF, 1=30s, 2=1m, 3=5m, 4=10m (default: 0)
+    - Timer resets on any button press or Flock detection; `u8g2.setPowerSave(1/0)` for hardware sleep/wake
+    - Scan tasks write `lastDisplayActivityMs` directly (atomic 32-bit); main loop calls `setPowerSave()` to keep SPI single-threaded
+  - All settings changed at runtime via the pause/settings menu (MUI form) and survive reboots
+  - Previously `enableWifiScan`/`enableBleScan`/`flockOnlyMode` were compile-time `#define` constants; do NOT revert to defines
 
 - **Output Flags**:
   - `ENABLE_CONSOLE_OUTPUT`: Enable/disable serial console output (default: false). Set to `false` in production to save processing time.
@@ -221,10 +222,11 @@ Key settings defined at the top of the sketch:
   - Active LOW, internal pullup enabled
   - **At boot**: hold button during power-on → file sharing mode (2-second window)
   - **During scan**: hold 1 second → pause (flushes SD, opens settings menu)
-  - **In settings menu**: short tap (<1s) advances cursor; hold 1s activates selected item
-    - Menu items: `WiFi: ON/OFF`, `BLE: ON/OFF`, `Flock: ON/OFF`, `Resume Scan` (4 items, cursor wraps)
-    - Selected item shown inverted on OLED
-    - Toggles are saved to NVS immediately
+  - **In settings menu**: short tap (<1s) → `mui_NextField()` advances MUI cursor; hold 1s → `saveSettings()` + `mui_SelectField()` activates
+    - Menu items (MUI form): `WiFi Scan [x]`, `BLE Scan [x]`, `Flock Only [x]`, `Disp off: Xm`, `Resume Scan` (5 items)
+    - Status bar remains visible at top of settings screen
+    - Focused item shown inverted; checkboxes toggle automatically via `MUIF_U8G2_U8_CHKBOX`; display timer cycles through options on each activate; Resume calls `resumeScanning()`
+    - Settings saved to NVS on every activate action
   - Device boots into scan mode by default (waits for GPS signal)
   - GPS signal is acquired on boot before scanning begins
 
@@ -284,8 +286,7 @@ Most libraries are included in the ESP32 Arduino core:
 
 External libraries required (install via Library Manager):
 - `TinyGPSPlus` - GPS NMEA/UBLOX sentence parsing
-- `Adafruit GFX Library` - Graphics library for OLED display
-- `Adafruit SSD1306` - OLED display driver (compatible with SSD1309)
+- `U8g2` (by olikraus) - OLED display driver and graphics; MUI (Menu User Interface) is included as part of U8g2 — no separate install needed
 - `Adafruit NeoPixel` - WS2812B RGB LED control
 - `ESP32Time` - RTC time management for ESP32 (persists time across reboots)
 - `ESPAsyncWebServer` - Async web server for file sharing mode
@@ -298,8 +299,7 @@ To install libraries:
 ```bash
 # Using Arduino CLI
 arduino-cli lib install "TinyGPSPlus"
-arduino-cli lib install "Adafruit GFX Library"
-arduino-cli lib install "Adafruit SSD1306"
+arduino-cli lib install "U8g2"
 arduino-cli lib install "Adafruit NeoPixel"
 arduino-cli lib install "ESP32Time"
 
@@ -317,23 +317,24 @@ Monitor serial output at 115200 baud to see scan results in real-time.
 - **Off**: Main loop running (LED turned off to conserve battery)
 
 **OLED Display:**
-The display provides real-time visual feedback (updates every 1 second):
-- **Top Left**: Satellite icon with signal bars showing GPS satellite count (1-5 bars)
-- **Top Center**: Battery indicator with icon and percentage
-- **Top Right**: Compass direction (N, NE, E, SE, S, SW, W, NW) based on GPS course (requires movement >1 km/h)
-- **Center Left**: Device counts showing "W:X(XX)" for WiFi, "B:X(XX)" for BLE
-  - First number = devices found in last scan
-  - Number in parentheses = total unique devices seen since startup
-  - **Asterisk (*)** appears when actively scanning (e.g., "W:5(23)*" during WiFi scan)
-- **Center Right**: Animated WiFi logo
-- **Bottom Left**: Current UTC time from GPS (HH:MM:SS format, updates every second)
-- **Bottom Right**: Current speed from GPS (format: "XXM YYK" for MPH and KPH, right-aligned)
+The display provides real-time visual feedback (updates every 1 second). All screens share a common status bar at y=0-11:
+- **Status bar** (top strip, present on every screen):
+  - **Left**: 5 ascending signal bars + satellite digit count (phone-style signal indicator)
+  - **Centre**: Compass direction (N/NE/E/SE/S/SW/W/NW), "---" when stationary
+  - **Right**: Battery fill icon + percentage ("85%"), right-aligned
+  - 1px separator line at y=11
+- **Scan mode content** (y=12 onwards):
+  - **WiFi row**: "W:X(XX)" — last scan count / total unique; asterisk (*) when actively scanning; "W:--" when disabled
+  - **BLE row**: "B:X(XX)" — same format
+  - **Flock row**: `FLOCK:N` inverted badge (white-on-black) when devices seen; `[FLOCK ONLY]` when that mode is active
+  - **Right**: Animated WiFi logo (arcs radiate outward each frame)
+  - **Bottom Left**: GPS time HH:MM:SS UTC
+  - **Bottom Right**: Speed in MPH and KPH, right-aligned
 
 **GPS Acquisition (on boot):**
 - Device boots into scan mode by default and waits for GPS signal
 - LED shows orange during GPS wait
-- Display shows "Waiting GPS" with satellite count and elapsed time
-- Battery level is also displayed during GPS wait
+- Display shows status bar (with live battery %) + "Waiting for GPS..." + satellite count and elapsed time
 - May take 30-60 seconds outdoors for initial fix
 - Serial monitor shows progress with satellite count updates
 - Once GPS fix acquired, LED turns green briefly, then off

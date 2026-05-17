@@ -22,8 +22,9 @@
 #include <SPI.h>
 #include <TinyGPSPlus.h>
 #include <HardwareSerial.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
+#include <U8g2lib.h>
+#include <mui.h>
+#include <mui_u8g2.h>
 #include <ESP32Time.h>
 #include <Adafruit_NeoPixel.h>
 #include <esp_task_wdt.h>
@@ -52,6 +53,10 @@
 #define OLED_RESET 10   // Reset pin
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
+
+// Font baseline offsets for u8g2 (y-as-baseline vs Adafruit y-as-top-left)
+#define FONT_SM_ASCENT 6   // u8g2_font_5x8_tf  ascent above baseline
+#define FONT_LG_ASCENT 14  // u8g2_font_10x20_tf ascent above baseline
 
 // RGB LED (WS2812B) Pin
 #define LED_PIN      27      // WS2812B data pin
@@ -154,6 +159,14 @@ int lastBLEScanCount = 0;     // Devices found in last scan
 volatile unsigned long flockLastSeenMs = 0;    // millis() when last Flock device was detected
 volatile unsigned long flockAlertUntilMs = 0;  // millis() until full-screen alert is shown
 
+// Display off timer
+const char* const dispTimerLabels[] = {"OFF", "30s", "1m", "5m", "10m"};
+const uint32_t    dispTimerMs[]     = {0, 30000UL, 60000UL, 300000UL, 600000UL};
+#define DISP_TIMER_COUNT 5
+uint8_t           displayTimerIdx       = 0;
+unsigned long     lastDisplayActivityMs = 0;
+bool              displayCurrentlyOff   = false;
+
 // Cached Flock count for display
 int cached_flock_total = 0;
 
@@ -177,8 +190,89 @@ String logFileName;
 // SD card mount status
 bool sdCardMounted = false;
 
-// OLED Display
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, OLED_MOSI, OLED_CLK, OLED_DC, OLED_RESET, OLED_CS);
+// OLED Display (SSD1309 128x64, software SPI, 180° rotation via U8G2_R2)
+U8G2_SSD1309_128X64_NONAME2_F_4W_SW_SPI u8g2(U8G2_R2, OLED_CLK, OLED_MOSI, OLED_CS, OLED_DC, OLED_RESET);
+
+// MUI (Menu User Interface) - settings menu rendered via u8g2
+mui_t mui;
+
+// Forward declarations for MUI callbacks
+uint8_t mui_resume_cb(mui_t *ui, uint8_t msg);
+uint8_t mui_disptimer_cb(mui_t *ui, uint8_t msg);
+
+muif_t muif_list[] = {
+  MUIF_U8G2_LABEL(),
+  MUIF_U8G2_U8_CHKBOX("W", (uint8_t*)&enableWifiScan),
+  MUIF_U8G2_U8_CHKBOX("B", (uint8_t*)&enableBleScan),
+  MUIF_U8G2_U8_CHKBOX("F", (uint8_t*)&flockOnlyMode),
+  MUIF_CUSTOM("D", NULL, mui_disptimer_cb),
+  MUIF_CUSTOM("R", NULL, mui_resume_cb),
+};
+
+// Content starts at y=12 (below status bar + separator). 8px row spacing.
+fds_t fds_settings[] =
+MUI_FORM(1)
+MUI_LABEL(2, 19, "== Settings ==")
+MUI_LABEL(2, 27, "WiFi Scan")
+MUI_XY("W", 110, 27)
+MUI_LABEL(2, 35, "BLE Scan")
+MUI_XY("B", 110, 35)
+MUI_LABEL(2, 43, "Flock Only")
+MUI_XY("F", 110, 43)
+MUI_XY("D", 2, 51)
+MUI_XY("R", 2, 59)
+MUI_DATA_END;
+
+// Cycles through display-off timer options on each hold-select
+uint8_t mui_disptimer_cb(mui_t *ui, uint8_t msg) {
+  uint8_t x = mui_get_x(ui);
+  uint8_t y = mui_get_y(ui);
+  char buf[20];
+  snprintf(buf, sizeof(buf), "Disp off: %s", dispTimerLabels[displayTimerIdx]);
+  switch (msg) {
+    case MUIF_MSG_DRAW:
+      u8g2.setFont(u8g2_font_5x8_tf);
+      u8g2.drawStr(x, y, buf);
+      break;
+    case MUIF_MSG_CURSOR_ENTER:
+      u8g2.setDrawColor(1);
+      u8g2.drawBox(0, y - 7, 128, 9);
+      u8g2.setDrawColor(0);
+      u8g2.setFont(u8g2_font_5x8_tf);
+      u8g2.drawStr(x, y, buf);
+      u8g2.setDrawColor(1);
+      break;
+    case MUIF_MSG_CURSOR_SELECT:
+      displayTimerIdx = (displayTimerIdx + 1) % DISP_TIMER_COUNT;
+      lastDisplayActivityMs = millis();  // Reset timer when user changes setting
+      break;
+  }
+  return 0;
+}
+
+uint8_t mui_resume_cb(mui_t *ui, uint8_t msg) {
+  uint8_t x = mui_get_x(ui);
+  uint8_t y = mui_get_y(ui);
+  switch (msg) {
+    case MUIF_MSG_DRAW:
+      u8g2.setFont(u8g2_font_5x8_tf);
+      u8g2.drawStr(x, y, "  Resume Scan  ");
+      break;
+    case MUIF_MSG_CURSOR_ENTER:
+      u8g2.setDrawColor(1);
+      u8g2.drawBox(0, y - 7, 128, 9);
+      u8g2.setDrawColor(0);
+      u8g2.setFont(u8g2_font_5x8_tf);
+      u8g2.drawStr(x, y, "  Resume Scan  ");
+      u8g2.setDrawColor(1);
+      break;
+    case MUIF_MSG_CURSOR_SELECT:
+      // Settings already saved by caller before mui_SelectField()
+      resumeScanning();
+      break;
+  }
+  return 0;
+}
 
 // RGB LED
 Adafruit_NeoPixel statusLED(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
@@ -193,7 +287,6 @@ bool fileSharingMode = false;
 bool scanMode = false;
 bool scanTasksStarted = false;
 bool scanPaused = false;  // Scan paused for safe power-off (button hold in scan mode)
-int  pauseMenuCursor = 0; // 0=WiFi toggle, 1=BLE toggle, 2=Flock Only toggle, 3=Resume
 Preferences prefs;        // NVS key-value store for settings persistence
 unsigned long gpsWaitStart = 0; // When GPS wait began (for elapsed time display)
 int gpsWaitDotCount = 0;        // Dot animation counter for GPS wait console output
@@ -314,25 +407,41 @@ void ledFileSharing() {
   setLEDColor(0, 100, 255);  // Blue: File sharing mode
 }
 
+// Wake the display and reset the inactivity timer.
+// Only called from the main loop (loop() context) — keeps SPI access single-threaded.
+// Scan tasks signal a wake by writing lastDisplayActivityMs directly (atomic 32-bit write).
+void wakeDisplay() {
+  lastDisplayActivityMs = millis();
+  if (displayCurrentlyOff && ENABLE_DISPLAY_OUTPUT) {
+    u8g2.setPowerSave(0);
+    displayCurrentlyOff = false;
+    lastDisplayUpdate = 0;  // Force immediate redraw on next loop iteration
+  }
+}
+
 // Load scanner settings from NVS (called once at boot)
 void loadSettings() {
   prefs.begin("scout", true);  // true = read-only
-  enableWifiScan = prefs.getBool("wifi",      true);
-  enableBleScan  = prefs.getBool("ble",       true);
-  flockOnlyMode  = prefs.getBool("flockonly", false);
+  enableWifiScan   = prefs.getBool("wifi",       true);
+  enableBleScan    = prefs.getBool("ble",        true);
+  flockOnlyMode    = prefs.getBool("flockonly",  false);
+  displayTimerIdx  = prefs.getUChar("disptimer", 0);
+  if (displayTimerIdx >= DISP_TIMER_COUNT) displayTimerIdx = 0;
   prefs.end();
-  consolePrintf("Settings loaded: WiFi=%s, BLE=%s, FlockOnly=%s\n",
+  consolePrintf("Settings loaded: WiFi=%s, BLE=%s, FlockOnly=%s, DispTimer=%s\n",
                 enableWifiScan ? "ON" : "OFF",
                 enableBleScan  ? "ON" : "OFF",
-                flockOnlyMode  ? "ON" : "OFF");
+                flockOnlyMode  ? "ON" : "OFF",
+                dispTimerLabels[displayTimerIdx]);
 }
 
 // Save scanner settings to NVS (called when user changes a toggle)
 void saveSettings() {
   prefs.begin("scout", false);  // false = read-write
-  prefs.putBool("wifi",      enableWifiScan);
-  prefs.putBool("ble",       enableBleScan);
-  prefs.putBool("flockonly", flockOnlyMode);
+  prefs.putBool("wifi",       enableWifiScan);
+  prefs.putBool("ble",        enableBleScan);
+  prefs.putBool("flockonly",  flockOnlyMode);
+  prefs.putUChar("disptimer", displayTimerIdx);
   prefs.end();
 }
 
@@ -789,17 +898,14 @@ void setup() {
   // Initialize OLED Display
   consolePrintln("\n[4/7] Initializing OLED display...");
   if (ENABLE_DISPLAY_OUTPUT) {
-    if(!display.begin(SSD1306_SWITCHCAPVCC)) {
-      consolePrintln("ERROR: SSD1306 allocation failed!");
+    if (!u8g2.begin()) {
+      consolePrintln("ERROR: u8g2 display init failed!");
       consolePrintln("Continuing without display...");
     } else {
-      display.setRotation(2);  // Rotate display 180 degrees
-      display.clearDisplay();
-      display.setTextSize(1);
-      display.setTextColor(SSD1306_WHITE);
-      display.setCursor(0, 0);
-      display.println("Initializing...");
-      display.display();
+      u8g2.clearBuffer();
+      u8g2.setFont(u8g2_font_5x8_tf);
+      u8g2.drawStr(0, FONT_SM_ASCENT, "Initializing...");
+      u8g2.sendBuffer();
       consolePrintln("Display initialized");
     }
   } else {
@@ -837,15 +943,12 @@ void setup() {
   // Holding at power-on (or immediately after) selects file sharing mode.
   // Releasing or not pressing selects scan mode (default).
   if (ENABLE_DISPLAY_OUTPUT) {
-    display.clearDisplay();
-    display.setTextSize(1);
-    display.setCursor(2, 0);
-    display.println("SignalScout");
-    display.setCursor(2, 16);
-    display.println("Hold btn: file share");
-    display.setCursor(2, 32);
-    display.println("Release:  scan mode");
-    display.display();
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_5x8_tf);
+    u8g2.drawStr(2, 6, "SignalScout");
+    u8g2.drawStr(2, 22, "Hold btn: file share");
+    u8g2.drawStr(2, 38, "Release:  scan mode");
+    u8g2.sendBuffer();
   }
   delay(2000);
 
@@ -950,9 +1053,24 @@ void loop() {
     lastBatteryRead = currentTime;
   }
 
+  // Display off timer: sleep/wake based on inactivity.
+  // Scan tasks signal a wake by writing lastDisplayActivityMs (atomic 32-bit write).
+  if (ENABLE_DISPLAY_OUTPUT && dispTimerMs[displayTimerIdx] > 0) {
+    bool shouldBeOff = (currentTime - lastDisplayActivityMs >= dispTimerMs[displayTimerIdx]);
+    if (shouldBeOff && !displayCurrentlyOff) {
+      u8g2.setPowerSave(1);
+      displayCurrentlyOff = true;
+    } else if (!shouldBeOff && displayCurrentlyOff) {
+      // Woken by Flock detection (scan task updated lastDisplayActivityMs)
+      u8g2.setPowerSave(0);
+      displayCurrentlyOff = false;
+      lastDisplayUpdate = 0;  // Force immediate redraw
+    }
+  }
+
   // Update display periodically - faster refresh during Flock alert for smooth blinking
   unsigned long displayInterval = (flockAlertUntilMs > currentTime) ? 250 : DISPLAY_UPDATE_INTERVAL;
-  if (ENABLE_DISPLAY_OUTPUT && currentTime - lastDisplayUpdate >= displayInterval) {
+  if (ENABLE_DISPLAY_OUTPUT && !displayCurrentlyOff && currentTime - lastDisplayUpdate >= displayInterval) {
     if (scanPaused) {
       updateDisplayPaused();
     } else if (fileSharingMode) {
@@ -973,21 +1091,28 @@ void loop() {
   if (shareButtonState && !buttonPressed) {
     buttonPressed = true;
     buttonPressStart = currentTime;
+    wakeDisplay();  // Any button press wakes the display
   } else if (!shareButtonState && buttonPressed) {
     unsigned long holdDuration = currentTime - buttonPressStart;
+    bool tapDetected  = (holdDuration < SHARE_HOLD_TIME);
+    bool holdDetected = (holdDuration >= SHARE_HOLD_TIME);
     if (scanMode && scanTasksStarted) {
       if (!scanPaused) {
         // Normal operation: long press pauses and opens settings menu
-        if (holdDuration >= SHARE_HOLD_TIME) {
-          pauseMenuCursor = 0;  // Reset cursor to top of menu
+        if (holdDetected) {
           pauseScanning();
         }
       } else {
-        // Paused / settings menu: short tap advances cursor, long press activates
-        if (holdDuration < SHARE_HOLD_TIME) {
-          pauseMenuCursor = (pauseMenuCursor + 1) % 4;
-        } else {
-          activatePauseMenuItem();
+        // Paused / settings menu: short tap advances MUI cursor, long press activates
+        if (tapDetected) {
+          mui_NextField(&mui);
+          updateDisplayPaused();
+        } else if (holdDetected) {
+          saveSettings();
+          mui_SelectField(&mui);
+          if (scanPaused) {  // Still paused (toggled a checkbox, not Resume)
+            updateDisplayPaused();
+          }
         }
       }
     }
@@ -1006,13 +1131,12 @@ void pauseScanning() {
 
   // Immediate display feedback before the queue-drain wait
   if (ENABLE_DISPLAY_OUTPUT) {
-    display.clearDisplay();
-    display.setTextSize(1);
-    display.setCursor(2, 0);
-    display.println("Pausing...");
-    display.setCursor(2, 16);
-    display.println("Flushing SD card");
-    display.display();
+    u8g2.clearBuffer();
+    drawStatusBar();
+    u8g2.setFont(u8g2_font_5x8_tf);
+    u8g2.drawStr(2, 22, "Pausing...");
+    u8g2.drawStr(2, 32, "Flushing SD card");
+    u8g2.sendBuffer();
   }
 
   // Stop new scans immediately
@@ -1036,6 +1160,9 @@ void pauseScanning() {
   if (sdLogTaskHandle != NULL) vTaskSuspend(sdLogTaskHandle);
 
   scanPaused = true;
+  // Initialize MUI settings form
+  mui_Init(&mui, &u8g2, fds_settings, muif_list, sizeof(muif_list) / sizeof(muif_list[0]));
+  mui_GotoForm(&mui, 1, 0);
   setLEDOff();
   consolePrintln("Scan paused - safe to power off. Hold button 1s to resume.");
 }
@@ -1051,83 +1178,13 @@ void resumeScanning() {
   consolePrintln("Scanning resumed.");
 }
 
-// Activate the currently highlighted pause menu item
-void activatePauseMenuItem() {
-  switch (pauseMenuCursor) {
-    case 0:  // Toggle WiFi
-      enableWifiScan = !enableWifiScan;
-      saveSettings();
-      consolePrintf("WiFi scanning %s\n", enableWifiScan ? "enabled" : "disabled");
-      break;
-    case 1:  // Toggle BLE
-      enableBleScan = !enableBleScan;
-      saveSettings();
-      consolePrintf("BLE scanning %s\n", enableBleScan ? "enabled" : "disabled");
-      break;
-    case 2:  // Toggle Flock Only
-      flockOnlyMode = !flockOnlyMode;
-      saveSettings();
-      consolePrintf("Flock-only mode %s\n", flockOnlyMode ? "enabled" : "disabled");
-      break;
-    case 3:  // Resume
-      resumeScanning();
-      break;
-  }
-}
-
 void updateDisplayPaused() {
-  display.clearDisplay();
-  display.setTextSize(1);
-
-  // Title bar
-  display.setCursor(2, 0);
-  display.println("== PAUSED / SETTINGS ==");
-
-  // Menu item 0: WiFi toggle
-  display.setCursor(2, 11);
-  if (pauseMenuCursor == 0) {
-    display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);  // Inverted = selected
-    display.printf(" WiFi:  %-3s ", enableWifiScan ? "ON" : "OFF");
-    display.setTextColor(SSD1306_WHITE);
-  } else {
-    display.printf("  WiFi:  %-3s ", enableWifiScan ? "ON" : "OFF");
-  }
-
-  // Menu item 1: BLE toggle
-  display.setCursor(2, 21);
-  if (pauseMenuCursor == 1) {
-    display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
-    display.printf(" BLE:   %-3s ", enableBleScan ? "ON" : "OFF");
-    display.setTextColor(SSD1306_WHITE);
-  } else {
-    display.printf("  BLE:   %-3s ", enableBleScan ? "ON" : "OFF");
-  }
-
-  // Menu item 2: Flock Only toggle
-  display.setCursor(2, 31);
-  if (pauseMenuCursor == 2) {
-    display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
-    display.printf(" Flock: %-3s ", flockOnlyMode ? "ON" : "OFF");
-    display.setTextColor(SSD1306_WHITE);
-  } else {
-    display.printf("  Flock: %-3s ", flockOnlyMode ? "ON" : "OFF");
-  }
-
-  // Menu item 3: Resume
-  display.setCursor(2, 41);
-  if (pauseMenuCursor == 3) {
-    display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
-    display.print(" Resume Scan ");
-    display.setTextColor(SSD1306_WHITE);
-  } else {
-    display.print("  Resume Scan");
-  }
-
-  // Hint at bottom
-  display.setCursor(2, 56);
-  display.print("Tap=next  Hold=sel");
-
-  display.display();
+  if (!ENABLE_DISPLAY_OUTPUT) return;
+  u8g2.clearBuffer();
+  drawStatusBar();
+  u8g2.setFont(u8g2_font_5x8_tf);
+  mui_Draw(&mui);
+  u8g2.sendBuffer();
 }
 
 // Format file size for display in file browser
@@ -1588,13 +1645,12 @@ void enterFileSharingMode() {
 
   // Immediate display feedback before radio init delays
   if (ENABLE_DISPLAY_OUTPUT) {
-    display.clearDisplay();
-    display.setTextSize(1);
-    display.setCursor(2, 0);
-    display.println("File Share Mode");
-    display.setCursor(2, 16);
-    display.println("Loading...");
-    display.display();
+    u8g2.clearBuffer();
+    drawStatusBar();
+    u8g2.setFont(u8g2_font_5x8_tf);
+    u8g2.drawStr(2, 22, "File Share Mode");
+    u8g2.drawStr(2, 32, "Loading...");
+    u8g2.sendBuffer();
   }
 
   // Suspend scanning and logging tasks to avoid SD and radio conflicts (if they exist)
@@ -1652,13 +1708,12 @@ void enterFileSharingMode() {
   consolePrintf("Connecting to WiFi: %s\n", WIFI_SSID);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   if (ENABLE_DISPLAY_OUTPUT) {
-    display.clearDisplay();
-    display.setTextSize(1);
-    display.setCursor(2, 0);
-    display.println("File Share Mode");
-    display.setCursor(2, 16);
-    display.println("Connecting...");
-    display.display();
+    u8g2.clearBuffer();
+    drawStatusBar();
+    u8g2.setFont(u8g2_font_5x8_tf);
+    u8g2.drawStr(2, 22, "File Share Mode");
+    u8g2.drawStr(2, 32, "Connecting...");
+    u8g2.sendBuffer();
   }
 
   // Try connecting with retries - ESP32-C5 sometimes needs multiple attempts after radio switch
@@ -1731,15 +1786,13 @@ void enterFileSharingMode() {
     if (sdLogTaskHandle) vTaskResume(sdLogTaskHandle);
 
     if (ENABLE_DISPLAY_OUTPUT) {
-      display.clearDisplay();
-      display.setTextSize(1);
-      display.setCursor(2, 0);
-      display.println("WiFi Connect");
-      display.setCursor(2, 16);
-      display.println("FAILED - check");
-      display.setCursor(2, 32);
-      display.println("secrets.h");
-      display.display();
+      u8g2.clearBuffer();
+      drawStatusBar();
+      u8g2.setFont(u8g2_font_5x8_tf);
+      u8g2.drawStr(2, 22, "WiFi Connect");
+      u8g2.drawStr(2, 32, "FAILED - check");
+      u8g2.drawStr(2, 42, "secrets.h");
+      u8g2.sendBuffer();
     }
     delay(3000);
     return;
@@ -1856,37 +1909,38 @@ void startScanTasks() {
 
 
 void updateDisplayFileSharing() {
-  display.clearDisplay();
-  display.setTextSize(2);
-  display.setCursor(2, 0);
-  display.println("FILE SHARE");
-  display.setTextSize(1);
-  display.setCursor(2, 22);
-  display.print("IP: ");
-  display.println(fileSharingIP);
-  display.setCursor(2, 38);
-  display.println("Power off when done");
-  display.setCursor(2, 50);
-  display.println("Boot normally to scan");
-  display.display();
+  if (!ENABLE_DISPLAY_OUTPUT) return;
+  u8g2.clearBuffer();
+  drawStatusBar();
+  u8g2.setFont(u8g2_font_10x20_tf);
+  u8g2.drawStr(2, 12 + FONT_LG_ASCENT, "FILE SHARE");  // baseline y=26
+  u8g2.setFont(u8g2_font_5x8_tf);
+  {
+    char ipBuf[40];
+    snprintf(ipBuf, sizeof(ipBuf), "IP: %s", fileSharingIP.c_str());
+    u8g2.drawStr(2, 38, ipBuf);
+  }
+  u8g2.drawStr(2, 48, "Power off when done");
+  u8g2.drawStr(2, 57, "Boot normally: scan");
+  u8g2.sendBuffer();
 }
 
 void updateDisplayGPSWait() {
   gpsWaitDotCount = (gpsWaitDotCount + 1) % 4;
   int sats = gps.satellites.isValid() ? gps.satellites.value() : 0;
   unsigned long elapsed = (millis() - gpsWaitStart) / 1000;
-
   consolePrintf("Waiting for GPS fix (Satellites: %d, Elapsed: %lus)\n", sats, elapsed);
-
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setCursor(0, 0);
-  display.println("Waiting for GPS...");
-  display.setCursor(0, 12);
-  display.printf("Sats: %d  Time: %lus", sats, elapsed);
-  display.setCursor(0, 24);
-  display.printf("Battery: %d%%", batteryPercent);
-  display.display();
+  if (!ENABLE_DISPLAY_OUTPUT) return;
+  u8g2.clearBuffer();
+  drawStatusBar();
+  u8g2.setFont(u8g2_font_5x8_tf);
+  u8g2.drawStr(2, 22, "Waiting for GPS...");
+  {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "Sats: %d  Time: %lus", sats, elapsed);
+    u8g2.drawStr(2, 32, buf);
+  }
+  u8g2.sendBuffer();
 }
 
 // Helper function to convert auth mode to string
@@ -2098,6 +2152,7 @@ bool scanWiFi() {
         seenFlockKeys.insert(bssidKey);
         uniqueFlockCount++;
         flockAlertUntilMs = millis() + 3000;
+        lastDisplayActivityMs = millis();  // Wake display for Flock alert
       }
       xSemaphoreGive(deviceMapMutex);
     }
@@ -2221,6 +2276,7 @@ void scanBluetooth() {
         seenFlockKeys.insert(addrKey);
         uniqueFlockCount++;
         flockAlertUntilMs = millis() + 3000;
+        lastDisplayActivityMs = millis();  // Wake display for Flock alert
       }
       xSemaphoreGive(deviceMapMutex);
     }
@@ -2400,282 +2456,218 @@ void displayGPSInfo() {
   consolePrintln("--- End GPS Info ---\n");
 }
 
-void updateDisplay(String statusMessage) {
-  // Full-screen blinking alert when a new Flock device is first detected
-  if (millis() < flockAlertUntilMs) {
-    bool inverted = (millis() / 350) % 2;
-    display.clearDisplay();
-    if (inverted) {
-      display.fillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, SSD1306_WHITE);
-      display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
-    } else {
-      display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
-    }
-    display.setTextSize(2);
-    display.setCursor(46, 14);   // "GET" centered
-    display.print("GET");
-    display.setCursor(4, 34);    // "FLOCKED!" centered
-    display.print("FLOCKED!");
-    display.setTextColor(SSD1306_WHITE);
-    display.display();
-    return;
-  }
+// Status bar: GPS bars + sat count (left) | compass (centre) | battery + % (right)
+// Occupies y=0-10; draws separator line at y=11. Used by every screen.
+void drawStatusBar() {
+  u8g2.setFont(u8g2_font_5x8_tf);
 
-  display.clearDisplay();
-
-  // Top Left: Satellite Signal Strength Indicator
-  drawSatelliteIndicator();
-
-  // Top Center: Battery Indicator
-  drawBatteryIndicator();
-
-  // Top Right: Compass Direction
-  drawCompass();
-
-  // Center: Status Message, Countdown Timer, or Device Stats
-  if (statusMessage.length() > 0 || !gpsTimeValid) {
-    display.setTextSize(1);
-    display.setCursor(0, 24);
-    if (statusMessage.length() > 0) {
-      display.println(statusMessage);
-    } 
-  } else {
-    // Show device statistics and countdown
-    display.setTextSize(1);
-
-    // Use cached device counts (updated in main loop every 200ms)
-    // This prevents display lag from mutex contention with scanning tasks
-    int wifi_last = cached_wifi_last;
-    int ble_last = cached_ble_last;
-    int wifi_total = cached_wifi_total;
-    int ble_total = cached_ble_total;
-
-    // WiFi count: Last scan (Total) - add asterisk when scanning, "--" when disabled
-    display.setCursor(2, 22);
-    if (!enableWifiScan) {
-      display.print("W:--");
-    } else if (wifiScanning) {
-      display.printf("W:%d(%d)*", wifi_last, wifi_total);
-    } else {
-      display.printf("W:%d(%d)", wifi_last, wifi_total);
-    }
-
-    // BLE count: Last scan (Total) - add asterisk when scanning, "--" when disabled
-    display.setCursor(2, 34);
-    if (!enableBleScan) {
-      display.print("B:--");
-    } else if (bleScanning) {
-      display.printf("B:%d(%d)*", ble_last, ble_total);
-    } else {
-      display.printf("B:%d(%d)", ble_last, ble_total);
-    }
-
-    // Flock row at y=46: inverted count when devices seen; plain mode label when flock-only active
-    if (cached_flock_total > 0) {
-      display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);  // Inverted: alert style
-      display.setCursor(2, 46);
-      display.printf("FLOCK:%d", cached_flock_total);
-      display.setTextColor(SSD1306_WHITE);  // Reset
-    } else if (flockOnlyMode) {
-      display.setCursor(2, 46);
-      display.print("[FLOCK ONLY]");
-    }
-
-    // Draw animated WiFi logo in center-right of screen
-    drawWiFiLogo(85, 22);
-
-    // Advance animation state for next frame
-    wifiAnimationState = (wifiAnimationState + 1) % 4;
-  }
-
-  // Bottom Left: GPS Time
-  drawGPSTime();
-
-  // Bottom Right: Speed
-  drawSpeed();
-
-  display.display();
-}
-
-void drawSatelliteIndicator() {
-  // Draw satellite icon (simple dish shape)
-  //display.drawCircle(6, 6, 4, SSD1306_WHITE);
-  //display.drawLine(6, 10, 6, 12, SSD1306_WHITE);
-  //display.drawLine(3, 12, 9, 12, SSD1306_WHITE);
-
-  // Draw signal bars based on satellite count
-  int satCount = 0;
-  if (gps.satellites.isValid()) {
-    satCount = gps.satellites.value();
-  }
-
-  // Draw up to 5 bars
-  int barHeight[] = {3, 5, 7, 9, 11};
-  int maxBars = 5;
+  // GPS signal bars — 5 ascending bars, bottom-aligned at y=10
+  int satCount = gps.satellites.isValid() ? gps.satellites.value() : 0;
   int activeBars = 0;
-
-  if (satCount >= 8) activeBars = 5;
+  if      (satCount >= 8) activeBars = 5;
   else if (satCount >= 6) activeBars = 4;
   else if (satCount >= 4) activeBars = 3;
   else if (satCount >= 2) activeBars = 2;
   else if (satCount >= 1) activeBars = 1;
 
-  for (int i = 0; i < maxBars; i++) {
-    int x = 20 + (i * 4);
-    int y = 12 - barHeight[i];
-    if (i < activeBars) {
-      display.fillRect(x, y, 3, barHeight[i], SSD1306_WHITE);
-    } else {
-      display.drawRect(x, y, 3, barHeight[i], SSD1306_WHITE);
-    }
+  int barH[] = {2, 4, 6, 8, 10};
+  for (int i = 0; i < 5; i++) {
+    int bx = 2 + i * 4;
+    int by = 10 - barH[i];
+    if (i < activeBars) u8g2.drawBox(bx, by, 3, barH[i]);
+    else                u8g2.drawFrame(bx, by, 3, barH[i]);
   }
 
-  // Display satellite count
-  display.setTextSize(1);
-  display.setCursor(2, 0);
+  // Satellite count next to bars
+  u8g2.setCursor(23, 10);
   if (gps.satellites.isValid()) {
-    display.printf("S:%d", satCount);
+    char buf[4];
+    snprintf(buf, sizeof(buf), "%d", satCount);
+    u8g2.print(buf);
   } else {
-    display.print("--");
+    u8g2.print("--");
   }
+
+  // Compass direction — centred at x=62
+  {
+    const char* dir = "---";
+    if (gps.course.isValid() && gps.speed.isValid() && gps.speed.kmph() > 1.0) {
+      double c = gps.course.deg();
+      if      (c >= 337.5 || c <  22.5) dir = "N";
+      else if (c >=  22.5 && c <  67.5) dir = "NE";
+      else if (c >=  67.5 && c < 112.5) dir = "E";
+      else if (c >= 112.5 && c < 157.5) dir = "SE";
+      else if (c >= 157.5 && c < 202.5) dir = "S";
+      else if (c >= 202.5 && c < 247.5) dir = "SW";
+      else if (c >= 247.5 && c < 292.5) dir = "W";
+      else                               dir = "NW";
+    }
+    u8g2.setCursor(62 - (int)(strlen(dir) * 3), 10);
+    u8g2.print(dir);
+  }
+
+  // Battery icon (right side): body x=108-123, tip x=124-126
+  {
+    int bx = 108, by = 1, bw = 16, bh = 9, tw = 3, th = 5;
+    u8g2.drawFrame(bx, by, bw, bh);
+    u8g2.drawBox(bx + bw, by + (bh - th) / 2, tw, th);
+    int fill = ((bw - 2) * batteryPercent) / 100;
+    if (fill < 0)      fill = 0;
+    if (fill > bw - 2) fill = bw - 2;
+    if (fill > 0)      u8g2.drawBox(bx + 1, by + 1, fill, bh - 2);
+
+    // Percentage text right-aligned to the left of the battery body
+    char pct[6];
+    snprintf(pct, sizeof(pct), "%d%%", batteryPercent);
+    int tw2 = strlen(pct) * 6;
+    u8g2.setCursor(bx - tw2 - 2, 10);
+    u8g2.print(pct);
+  }
+
+  // Separator line
+  u8g2.drawHLine(0, 11, 128);
 }
 
-void drawCompass() {
-  // Calculate compass direction from GPS course
-  String direction = "---";
-  int courseDegrees = 0;
-  bool validCourse = false;
+void updateDisplay(String statusMessage) {
+  if (!ENABLE_DISPLAY_OUTPUT) return;
 
-  if (gps.course.isValid() && gps.speed.isValid() && gps.speed.kmph() > 1.0) {
-    double course = gps.course.deg();
-    courseDegrees = (int)course;
-    validCourse = true;
-
-    // Convert degrees to compass direction
-    if (course >= 337.5 || course < 22.5) direction = "N";
-    else if (course >= 22.5 && course < 67.5) direction = "NE";
-    else if (course >= 67.5 && course < 112.5) direction = "E";
-    else if (course >= 112.5 && course < 157.5) direction = "SE";
-    else if (course >= 157.5 && course < 202.5) direction = "S";
-    else if (course >= 202.5 && course < 247.5) direction = "SW";
-    else if (course >= 247.5 && course < 292.5) direction = "W";
-    else if (course >= 292.5 && course < 337.5) direction = "NW";
+  // Full-screen blinking alert for new Flock detection — no status bar, maximum impact
+  if (millis() < flockAlertUntilMs) {
+    bool inverted = (millis() / 350) % 2;
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_10x20_tf);
+    if (inverted) {
+      u8g2.setDrawColor(1);
+      u8g2.drawBox(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+      u8g2.setDrawColor(0);
+    } else {
+      u8g2.setDrawColor(1);
+    }
+    u8g2.drawStr(46, 28, "GET");
+    u8g2.drawStr(4, 50, "FLOCKED!");
+    u8g2.setDrawColor(1);
+    u8g2.sendBuffer();
+    return;
   }
 
-  // Draw degree heading (left side, size 1)
-  //display.setTextSize(1);
-  //if (validCourse) {
-  //  char degStr[5];
-  //  snprintf(degStr, sizeof(degStr), "%03d", courseDegrees);
-  //  display.setCursor(SCREEN_WIDTH - 48, 0);  // Position before compass direction
-  //  display.print(degStr);
-  //  display.print((char)247);  // Degree symbol
-  //}
+  u8g2.clearBuffer();
+  drawStatusBar();
+  u8g2.setFont(u8g2_font_5x8_tf);
 
-  // Draw compass direction on top right (size 2, right-aligned with 2px margin)
-  display.setTextSize(2);
-  int textWidth = direction.length() * 12;
-  display.setCursor(SCREEN_WIDTH - textWidth - 2, 0);
-  display.print(direction);
+  // Content area below status bar (y=12-53), bottom bar (y=56-63)
+  if (statusMessage.length() > 0 || !gpsTimeValid) {
+    if (statusMessage.length() > 0) {
+      u8g2.setCursor(2, 22);
+      u8g2.print(statusMessage);
+    }
+  } else {
+    int wifi_last  = cached_wifi_last;
+    int ble_last   = cached_ble_last;
+    int wifi_total = cached_wifi_total;
+    int ble_total  = cached_ble_total;
+
+    // WiFi count row
+    u8g2.setCursor(2, 22);
+    {
+      char buf[24];
+      if (!enableWifiScan) {
+        u8g2.print("W:--");
+      } else if (wifiScanning) {
+        snprintf(buf, sizeof(buf), "W:%d(%d)*", wifi_last, wifi_total);
+        u8g2.print(buf);
+      } else {
+        snprintf(buf, sizeof(buf), "W:%d(%d)", wifi_last, wifi_total);
+        u8g2.print(buf);
+      }
+    }
+
+    // BLE count row
+    u8g2.setCursor(2, 32);
+    {
+      char buf[24];
+      if (!enableBleScan) {
+        u8g2.print("B:--");
+      } else if (bleScanning) {
+        snprintf(buf, sizeof(buf), "B:%d(%d)*", ble_last, ble_total);
+        u8g2.print(buf);
+      } else {
+        snprintf(buf, sizeof(buf), "B:%d(%d)", ble_last, ble_total);
+        u8g2.print(buf);
+      }
+    }
+
+    // Flock row (inverted badge when devices seen)
+    if (cached_flock_total > 0) {
+      char buf[16];
+      snprintf(buf, sizeof(buf), "FLOCK:%d", cached_flock_total);
+      int bw = strlen(buf) * 6 + 2;
+      u8g2.drawBox(2, 38, bw, 9);
+      u8g2.setDrawColor(0);
+      u8g2.setCursor(3, 38 + FONT_SM_ASCENT);
+      u8g2.print(buf);
+      u8g2.setDrawColor(1);
+    } else if (flockOnlyMode) {
+      u8g2.setCursor(2, 38 + FONT_SM_ASCENT);
+      u8g2.print("[FLOCK ONLY]");
+    }
+
+    // Animated WiFi logo (right side, cx≈101 cy≈40)
+    drawWiFiLogo(85, 14);
+    wifiAnimationState = (wifiAnimationState + 1) % 4;
+  }
+
+  drawGPSTime();
+  drawSpeed();
+  u8g2.sendBuffer();
 }
 
 void drawGPSTime() {
-  display.setTextSize(1);
-  display.setCursor(2, SCREEN_HEIGHT - 8);  // 2px left margin
-
+  u8g2.setFont(u8g2_font_5x8_tf);
+  u8g2.setCursor(2, SCREEN_HEIGHT - 2);  // Baseline near bottom edge
   if (gps.time.isValid()) {
-    // Use GPS time when available
     char timeStr[12];
     snprintf(timeStr, sizeof(timeStr), "%02d:%02d:%02d",
              gps.time.hour(), gps.time.minute(), gps.time.second());
-    display.print(timeStr);
+    u8g2.print(timeStr);
   } else if (rtc.getYear() > 2020) {
-    // Fallback to RTC time
     char timeStr[12];
     snprintf(timeStr, sizeof(timeStr), "%02d:%02d:%02d",
              rtc.getHour(true), rtc.getMinute(), rtc.getSecond());
-    display.print(timeStr);
+    u8g2.print(timeStr);
   } else {
-    display.print("--:--:--");
+    u8g2.print("--:--:--");
   }
 }
 
 void drawSpeed() {
-  display.setTextSize(1);
-
+  u8g2.setFont(u8g2_font_5x8_tf);
+  char speedStr[24];
   if (gps.speed.isValid()) {
-    double mph = gps.speed.mph();
-    double kph = gps.speed.kmph();
-
-    char speedStr[24];
-    snprintf(speedStr, sizeof(speedStr), "%.0fMPH %.0fKPH", mph, kph);
-
-    int textWidth = strlen(speedStr) * 6;  // 6px per char in size 1
-    display.setCursor(SCREEN_WIDTH - textWidth - 2, SCREEN_HEIGHT - 8);  // 2px right margin
-    display.print(speedStr);
+    snprintf(speedStr, sizeof(speedStr), "%.0fMPH %.0fKPH",
+             gps.speed.mph(), gps.speed.kmph());
   } else {
-    int textWidth = 5 * 6;  // "0M 0K" = 5 chars
-    display.setCursor(SCREEN_WIDTH - textWidth - 2, SCREEN_HEIGHT - 8);  // 2px right margin
-    display.print("0M 0K");
+    snprintf(speedStr, sizeof(speedStr), "0M 0K");
   }
+  int textWidth = strlen(speedStr) * 6;
+  u8g2.setCursor(SCREEN_WIDTH - textWidth - 2, SCREEN_HEIGHT - 2);
+  u8g2.print(speedStr);
 }
 
-void drawBatteryIndicator() {
-  // Battery icon dimensions
-  int battX = 50;  // X position (between satellite and compass)
-  int battY = 2;   // Y position
-  int battWidth = 16;
-  int battHeight = 8;
-  int tipWidth = 2;
-  int tipHeight = 4;
-
-  // Draw battery outline
-  display.drawRect(battX, battY, battWidth, battHeight, SSD1306_WHITE);
-
-  // Draw battery tip (positive terminal)
-  display.fillRect(battX + battWidth, battY + (battHeight - tipHeight) / 2,
-                   tipWidth, tipHeight, SSD1306_WHITE);
-
-  // Calculate fill width based on percentage
-  int fillWidth = ((battWidth - 2) * batteryPercent) / 100;
-  if (fillWidth < 0) fillWidth = 0;
-  if (fillWidth > battWidth - 2) fillWidth = battWidth - 2;
-
-  // Fill battery based on charge level
-  if (fillWidth > 0) {
-    display.fillRect(battX + 1, battY + 1, fillWidth, battHeight - 2, SSD1306_WHITE);
-  }
-
-  // Draw percentage text below battery if space allows, or to the side
-  // Using small font next to battery
-  display.setTextSize(1);
-  display.setCursor(battX + battWidth + tipWidth + 2, battY);
-  display.printf("%d", batteryPercent);
-}
 
 void drawWiFiLogo(int x, int y) {
-  // Animated WiFi icon - signal arcs radiating upward
-  // wifiAnimationState: 0 = dot only, 1 = 1 ring, 2 = 2 rings, 3 = 3 rings
-  int cx = x + 16;  // Center x
-  int cy = y + 26;  // Bottom point (where dot is)
-
-  // Always draw center dot
-  display.fillCircle(cx, cy, 3, SSD1306_WHITE);
-
-  // Draw rings based on animation state
-  int ringRadii[] = {8, 15, 22};  // Radii for the 3 rings
-
+  int cx = x + 16;
+  int cy = y + 26;
+  u8g2.drawDisc(cx, cy, 3);
+  int ringRadii[] = {8, 15, 22};
   for (int ring = 0; ring < wifiAnimationState && ring < 3; ring++) {
     int r = ringRadii[ring];
-    // Draw arc from -50 to +50 degrees
     for (int angle = -55; angle <= 55; angle += 2) {
       float rad = angle * PI / 180.0;
       int px = cx + (int)(r * sin(rad));
       int py = cy - (int)(r * cos(rad));
-      display.drawPixel(px, py, SSD1306_WHITE);
-      // Make arcs thicker (draw adjacent pixels)
-      display.drawPixel(px, py - 1, SSD1306_WHITE);
-      display.drawPixel(px + 1, py, SSD1306_WHITE);
+      u8g2.drawPixel(px, py);
+      u8g2.drawPixel(px, py - 1);
+      u8g2.drawPixel(px + 1, py);
     }
   }
 }
