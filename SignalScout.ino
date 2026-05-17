@@ -23,8 +23,6 @@
 #include <TinyGPSPlus.h>
 #include <HardwareSerial.h>
 #include <U8g2lib.h>
-#include <mui.h>
-#include <mui_u8g2.h>
 #include <ESP32Time.h>
 #include <Adafruit_NeoPixel.h>
 #include <esp_task_wdt.h>
