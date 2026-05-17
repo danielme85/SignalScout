@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - 'v*'
+  pull_request:
   workflow_dispatch:   # allow manual test builds without tagging
 
 permissions:
@@ -46,8 +47,7 @@ jobs:
       - name: Install libraries from Library Manager
         run: |
           arduino-cli lib install "TinyGPSPlus"
-          arduino-cli lib install "Adafruit GFX Library"
-          arduino-cli lib install "Adafruit SSD1306"
+          arduino-cli lib install "U8g2"
           arduino-cli lib install "Adafruit NeoPixel"
           arduino-cli lib install "ESP32Time"
 
