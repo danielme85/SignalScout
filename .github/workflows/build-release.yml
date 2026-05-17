@@ -13,6 +13,16 @@ jobs:
   build:
     runs-on: ubuntu-latest
 
+    strategy:
+      matrix:
+        include:
+          # Standard ESP32-C5 dev board: 16MB flash, 8MB PSRAM
+          - name: esp32c5-16mb
+            fqbn: "esp32:esp32:esp32c5:FlashSize=16M,PartitionScheme=huge_app,PSRAM=enabled"
+          # Seeed XIAO ESP32-C5: 8MB flash, 8MB PSRAM
+          - name: xiao-esp32c5-8mb
+            fqbn: "esp32:esp32:esp32c5:FlashSize=8M,PartitionScheme=huge_app,PSRAM=enabled"
+
     steps:
       - uses: actions/checkout@v4
 
@@ -65,13 +75,10 @@ jobs:
           EOF
 
       # ── Compile ───────────────────────────────────────────────────────────
-      # The repo root is the sketch directory (SignalScout.ino lives here).
-      # Board: ESP32-C5 (16 MB flash, 8 MB PSRAM).
-      # Adjust FlashSize / PSRAM options if your hardware differs.
-      - name: Compile sketch
+      - name: Compile sketch (${{ matrix.name }})
         run: |
           arduino-cli compile \
-            --fqbn "esp32:esp32:esp32c5:FlashSize=16M,PartitionScheme=huge_app,PSRAM=enabled" \
+            --fqbn "${{ matrix.fqbn }}" \
             --export-binaries \
             --output-dir build \
             .
@@ -80,13 +87,13 @@ jobs:
         run: ls -lh build/
 
       # ── Merge into a single flashable binary ──────────────────────────────
-      # Produces SignalScout-merged.bin that can be flashed at address 0x0
+      # Produces SignalScout-<target>-merged.bin flashable at address 0x0
       # with esptool.py or the Espressif Flash Download Tool.
       - name: Merge bootloader + partition table + app into one binary
         run: |
           pip install esptool --quiet
           esptool.py --chip esp32c5 merge_bin \
-            --output build/SignalScout-merged.bin \
+            --output build/SignalScout-${{ matrix.name }}-merged.bin \
             0x0     build/SignalScout.ino.bootloader.bin \
             0x8000  build/SignalScout.ino.partitions.bin \
             0x10000 build/SignalScout.ino.bin
@@ -95,12 +102,12 @@ jobs:
       - name: Upload firmware artifact
         uses: actions/upload-artifact@v4
         with:
-          name: SignalScout-firmware-${{ github.ref_name || github.sha }}
+          name: SignalScout-${{ matrix.name }}-${{ github.ref_name || github.sha }}
           path: |
             build/SignalScout.ino.bin
             build/SignalScout.ino.bootloader.bin
             build/SignalScout.ino.partitions.bin
-            build/SignalScout-merged.bin
+            build/SignalScout-${{ matrix.name }}-merged.bin
 
       # ── GitHub Release (tag pushes only) ──────────────────────────────────
       - name: Create GitHub Release
@@ -110,7 +117,7 @@ jobs:
           name: "SignalScout ${{ github.ref_name }}"
           generate_release_notes: true
           files: |
-            build/SignalScout-merged.bin
+            build/SignalScout-${{ matrix.name }}-merged.bin
             build/SignalScout.ino.bin
             build/SignalScout.ino.bootloader.bin
             build/SignalScout.ino.partitions.bin

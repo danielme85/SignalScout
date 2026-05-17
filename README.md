@@ -29,7 +29,7 @@ SignalScout is a wardriving and wireless reconnaissance tool that scans 2.4GHz a
 
 | Component | Example Model | Connection |
 |-----------|--------------|------------|
-| **Microcontroller** | ESP32-C5 Dev Board (16MB Flash, 8MB PSRAM) | - |
+| **Microcontroller** | ESP32-C5 Dev Board (16MB Flash, 8MB PSRAM) **or** Seeed XIAO ESP32-C5 (8MB Flash, 8MB PSRAM) | - |
 | **GPS Module** | NEO-6M or NEO-7M | UART (RX:14, TX:13) |
 | **OLED Display** | SSD1309 128x64 (or SSD1306) | SPI (MOSI:26, CLK:25, DC:9, CS:8, RST:10) |
 | **SD Card Module** | Micro SD SPI adapter | SPI (MOSI:3, MISO:1, CLK:0, CS:2) |
@@ -89,22 +89,25 @@ The OLED display provides real-time visual feedback, updating every 1 second:
 
 ## Pre-built Firmware
 
-Every tagged release on GitHub includes ready-to-flash firmware built automatically by GitHub Actions. No Arduino IDE required to flash.
+Every tagged release on GitHub includes ready-to-flash firmware built automatically by GitHub Actions for **two targets**. No Arduino IDE required to flash.
 
 ### Files in each release
 
-| File | Use |
-|------|-----|
-| `SignalScout-merged.bin` | **Recommended** — single file, flash at address `0x0` |
-| `SignalScout.ino.bin` | App only — flash at `0x10000` |
-| `SignalScout.ino.bootloader.bin` | Bootloader — flash at `0x0` |
-| `SignalScout.ino.partitions.bin` | Partition table — flash at `0x8000` |
+| File | Target | Use |
+|------|--------|-----|
+| `SignalScout-esp32c5-16mb-merged.bin` | ESP32-C5 dev board (16MB flash) | **Recommended** — single file, flash at `0x0` |
+| `SignalScout-xiao-esp32c5-8mb-merged.bin` | Seeed XIAO ESP32-C5 (8MB flash) | **Recommended for XIAO** — flash at `0x0` |
+| `SignalScout.ino.bin` | (both) | App only — flash at `0x10000` |
+| `SignalScout.ino.bootloader.bin` | (both) | Bootloader — flash at `0x0` |
+| `SignalScout.ino.partitions.bin` | (both) | Partition table — flash at `0x8000` |
 
 ### Flashing with esptool.py
 
 ```bash
-# Easiest — merged binary, single command
-esptool.py --chip esp32c5 --port /dev/ttyUSB0 write_flash 0x0 SignalScout-merged.bin
+# Easiest — merged binary, single command (pick the right file for your board)
+esptool.py --chip esp32c5 --port /dev/ttyUSB0 write_flash 0x0 SignalScout-esp32c5-16mb-merged.bin
+# or for XIAO:
+esptool.py --chip esp32c5 --port /dev/ttyUSB0 write_flash 0x0 SignalScout-xiao-esp32c5-8mb-merged.bin
 ```
 
 ### Releasing a new version
@@ -275,18 +278,16 @@ const char* WIFI_PASSWORD = "YourNetworkPassword";
 
 SignalScout automatically identifies **Flock Safety** (now SoundThinking) license plate readers, Penguin external battery packs, and Raven acoustic gunshot sensors while scanning. These are fixed surveillance devices commonly found on utility poles and street furniture.
 
-Signatures are sourced from [MaxwellDPS/Flock-You-Android](https://github.com/MaxwellDPS/Flock-You-Android) and [justcallmekoko/ESP32Marauder](https://github.com/justcallmekoko/ESP32Marauder).
+Signatures are sourced from [colonelpanichacks/flock-you](https://github.com/colonelpanichacks/flock-you), [MaxwellDPS/Flock-You-Android](https://github.com/MaxwellDPS/Flock-You-Android), and [justcallmekoko/ESP32Marauder](https://github.com/justcallmekoko/ESP32Marauder).
 
 ### What It Detects
 
 **WiFi (via SSID prefix or hardware OUI):**
 - SSID prefixes: `flock`, `fs-`, `fs_`, `falcon`, `sparrow`, `condor`, `penguin`, `pigvision`, `fs ext batt`
-- Quectel LTE modem OUIs: `50:29:4D`, `86:25:19`
-- Telit LTE modem OUIs: `00:14:2D`, `D8:C7:71`
-- Flock Safety registered OUI: `B4:1E:52`
+- **36 hardware OUIs** — 31 field-verified entries from colonelpanichacks research plus Quectel (`50:29:4D`, `86:25:19`), Telit (`00:14:2D`, `D8:C7:71`), and Flock Safety direct (`B4:1E:52`)
 
 **BLE (via device name, service UUID, or manufacturer data):**
-- Device name prefixes: `flock`, `falcon`, `raven`, `penguin-`, `fs ext batt`, `soundthinking`, `shotspotter`
+- Device name prefixes: `flock`, `falcon`, `raven`, `penguin` (any variant), `pigvision`, `fs ext batt`, `soundthinking`, `shotspotter`
 - Raven service UUIDs (firmware 1.2.x+): `00003100` (GPS Location), `00003200` (Power Management), `00003300` (Network Status), `00003400` (Upload Statistics), `00003500` (Error/Diagnostics)
 - Legacy Raven service UUIDs (firmware 1.1.x): `00001809`, `00001819`
 - Xuntong manufacturer data (`C809` prefix) — identifies Flock Penguin external battery packs by ODM chip
@@ -396,7 +397,7 @@ WiFi credentials for file sharing are stored separately in `secrets.h` (see [Fil
 // Scans run sequentially: WiFi → BLE → repeat
 
 // WiFi driver stability
-#define WIFI_DRIVER_RESET_INTERVAL_MS (5UL * 60UL * 1000UL)  // Proactive reset every 5 min
+#define WIFI_DRIVER_RESET_INTERVAL_MS (15UL * 60UL * 1000UL)  // Proactive mode reset every 15 min
 
 // Battery voltage divider
 #define VOLTAGE_DIVIDER_RATIO 3.333333  // For 200k/100k divider
@@ -418,7 +419,7 @@ The pause/settings menu lets you toggle scanning modes at runtime without reflas
 | **"Waiting GPS" forever** | GPS needs clear sky view, move outdoors, wait up to 2 minutes for cold start |
 | **Display shows nothing** | Verify OLED wiring, check if SSD1309/SSD1306 is set correctly in code |
 | **No WiFi networks found** | Normal in remote areas, verify ESP32 WiFi is working |
-| **WiFi stops working after ~10 min** | The proactive 5-minute driver reset should prevent this; reduce `WIFI_DRIVER_RESET_INTERVAL_MS` if still occurring |
+| **WiFi stops working** | Fixed in firmware — root cause was a start→stop race in the proactive reset. Update to latest firmware. |
 | **Compass shows "---"** | GPS course requires movement >1 km/h, start walking/driving |
 | **LED stays red** | Initialization stuck, check serial monitor for errors |
 | **LED stays orange** | GPS not getting signal, move to open sky area |
