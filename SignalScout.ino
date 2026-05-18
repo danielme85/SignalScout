@@ -202,11 +202,11 @@ uint8_t mui_disptimer_cb(mui_t *ui, uint8_t msg);
 
 muif_t muif_list[] = {
   MUIF_U8G2_LABEL(),
-  MUIF_U8G2_U8_CHKBOX("W", (uint8_t*)&enableWifiScan),
-  MUIF_U8G2_U8_CHKBOX("B", (uint8_t*)&enableBleScan),
-  MUIF_U8G2_U8_CHKBOX("F", (uint8_t*)&flockOnlyMode),
-  MUIF_CUSTOM("D", NULL, mui_disptimer_cb),
-  MUIF_CUSTOM("R", NULL, mui_resume_cb),
+  MUIF_VARIABLE("W", (uint8_t*)&enableWifiScan, mui_u8g2_u8_chkbox_wm_pi),
+  MUIF_VARIABLE("B", (uint8_t*)&enableBleScan,  mui_u8g2_u8_chkbox_wm_pi),
+  MUIF_VARIABLE("F", (uint8_t*)&flockOnlyMode,  mui_u8g2_u8_chkbox_wm_pi),
+  MUIF_BUTTON("D", mui_disptimer_cb),
+  MUIF_BUTTON("R", mui_resume_cb),
 };
 
 // Content starts at y=12 (below status bar + separator). 8px row spacing.
@@ -221,7 +221,7 @@ MUI_LABEL(2, 43, "Flock Only")
 MUI_XY("F", 110, 43)
 MUI_XY("D", 2, 51)
 MUI_XY("R", 2, 59)
-MUI_DATA_END;
+;
 
 // Cycles through display-off timer options on each hold-select
 uint8_t mui_disptimer_cb(mui_t *ui, uint8_t msg) {
@@ -1109,7 +1109,7 @@ void loop() {
           updateDisplayPaused();
         } else if (holdDetected) {
           saveSettings();
-          mui_SelectField(&mui);
+          mui_SendSelect(&mui);
           if (scanPaused) {  // Still paused (toggled a checkbox, not Resume)
             updateDisplayPaused();
           }
