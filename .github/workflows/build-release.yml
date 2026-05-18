@@ -102,7 +102,7 @@ jobs:
       - name: Upload firmware artifact
         uses: actions/upload-artifact@v4
         with:
-          name: SignalScout-${{ matrix.name }}-${{ github.ref_name || github.sha }}
+          name: SignalScout-${{ matrix.name }}-${{ github.run_number }}
           path: |
             build/SignalScout.ino.bin
             build/SignalScout.ino.bootloader.bin
