@@ -34,23 +34,24 @@
 #include <ESPAsyncWebServer.h>
 #include <Preferences.h>    // NVS key-value store for persisting settings
 
-// SD Card SPI Pins (adjust these based on your wiring)
-#define SD_CS    1  // Chip Select
-#define SD_MOSI  0  // MOSI
-#define SD_MISO  3  // MISO
-#define SD_SCK   2  // SCK
+// === Board v1 PCB Pinout ===
+// SD Card and OLED share the same SPI bus (GPIO 8/10)
 
-// GPS UART Pins (adjust these based on your wiring)
-#define GPS_RX   14  // ESP32 RX pin (connects to GPS TX)
-#define GPS_TX   13  // ESP32 TX pin (connects to GPS RX)
+// SD Card SPI Pins
+#define SD_CS    4   // Chip Select (D3)
+#define SD_MOSI  10  // MOSI — shared with OLED (D10)
+#define SD_MISO  9   // MISO (D9)
+#define SD_SCK   8   // SCK — shared with OLED (D8)
+
+// GPS UART Pins
+#define GPS_RX   6   // ESP32 RX ← GPS TX (D6)
+#define GPS_TX   7   // ESP32 TX → GPS RX (D7)
 #define GPS_BAUD 9600
 
-// OLED Display SPI Pins (adjust these based on your wiring)
-#define OLED_MOSI  26  // Can share with SD card MOSI
-#define OLED_CLK   25  // Can share with SD card SCK
-#define OLED_DC    9   // Data/Command pin
-#define OLED_CS    8  // Chip Select (different from SD card)
-#define OLED_RESET 10   // Reset pin
+// OLED Display SPI Pins (shares bus with SD card)
+#define OLED_DC    3              // Data/Command (D2)
+#define OLED_CS    11             // Chip Select (D4)
+#define OLED_RESET U8X8_PIN_NONE  // RST tied to 3V3 on PCB — no GPIO needed
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 
@@ -58,25 +59,13 @@
 #define FONT_SM_ASCENT 6   // u8g2_font_5x8_tf  ascent above baseline
 #define FONT_LG_ASCENT 14  // u8g2_font_10x20_tf ascent above baseline
 
-// RGB LED (WS2812B) Pin
-#define LED_PIN      27      // WS2812B data pin
-#define LED_COUNT    1       // Number of LEDs
+// Rotary Encoder Pins (replaces single mode button)
+#define ENC_A_PIN    1     // Encoder A / CLK (D0) — external 10k pull-up + 10nF debounce on PCB
+#define ENC_B_PIN    2     // Encoder B / DT  (D1) — external 10k pull-up + 10nF debounce on PCB
+#define ENC_SW_PIN   12    // Encoder switch  (D5) — external 10k pull-up on PCB
+#define ENC_HOLD_TIME 1000 // Hold for 1 second to trigger action (ms)
 
-// Mode Button Pin
-#define SHARE_BUTTON_PIN  23    // GPIO for mode button (active LOW, internal pullup)
-#define SHARE_HOLD_TIME   1000  // Hold for 1 second to trigger action (ms)
-
-// Battery ADC Pin
-#define BATTERY_PIN  6       // ADC pin for battery voltage
-#define BATTERY_SAMPLES 10   // Number of ADC samples to average
-
-// Battery voltage thresholds (3.7V LiPo)
-// Voltage divider: 200k (positive side) / 100k (to ground) = divides by 3.333333
-// Full charge: 3.7V -> 1.4V at ADC
-// Empty: 3.0V -> 1.0V at ADC
-#define BATTERY_FULL_VOLTAGE  3.7
-#define BATTERY_EMPTY_VOLTAGE 3.0
-#define VOLTAGE_DIVIDER_RATIO 3.333333
+// Board v1 has no RGB LED and no battery ADC — both features disabled
 
 // Scan settings
 #define SCAN_INTERVAL 10  // WiFi and BLE scan every x seconds
@@ -191,7 +180,8 @@ String logFileName;
 bool sdCardMounted = false;
 
 // OLED Display (SSD1309 128x64, software SPI, 180° rotation via U8G2_R2)
-U8G2_SSD1309_128X64_NONAME2_F_4W_SW_SPI u8g2(U8G2_R2, OLED_CLK, OLED_MOSI, OLED_CS, OLED_DC, OLED_RESET);
+// Board v1: OLED shares HW SPI bus with SD card. RST is tied to 3V3 (U8X8_PIN_NONE).
+U8G2_SSD1309_128X64_NONAME2_F_4W_HW_SPI u8g2(U8G2_R2, OLED_CS, OLED_DC, OLED_RESET);
 
 // MUI (Menu User Interface) - settings menu rendered via u8g2
 mui_t mui;
@@ -274,13 +264,10 @@ uint8_t mui_resume_cb(mui_t *ui, uint8_t msg) {
   return 0;
 }
 
-// RGB LED
-Adafruit_NeoPixel statusLED(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
+// Board v1: no RGB LED
 
-// Battery monitoring
+// Board v1: no battery ADC — percent fixed at 0
 int batteryPercent = 0;
-unsigned long lastBatteryRead = 0;
-#define BATTERY_READ_INTERVAL 5000  // Read battery every 5 seconds
 
 // Operating mode flags
 bool fileSharingMode = false;
@@ -297,9 +284,10 @@ bool serverRoutesConfigured = false;
 // WiFi logo animation state (0 = dot only, 1-3 = number of rings)
 int wifiAnimationState = 0;
 
-// Sleep button state tracking
-unsigned long buttonPressStart = 0;
-bool buttonPressed = false;
+// Rotary encoder state
+volatile int8_t encoderDelta = 0;   // Accumulated rotation ticks (ISR-written)
+unsigned long encSwPressStart = 0;
+bool encSwPressed = false;
 
 BLEScan* pBLEScan;
 
@@ -379,33 +367,12 @@ void consolePrintf(const char* format, ...) {
   }
 }
 
-// LED color helper functions
-void setLEDColor(uint8_t r, uint8_t g, uint8_t b) {
-  statusLED.setPixelColor(0, statusLED.Color(r, g, b));
-  statusLED.show();
-}
-
-void setLEDOff() {
-  statusLED.setPixelColor(0, 0);
-  statusLED.show();
-}
-
-// LED status indicators
-void ledInitializing() {
-  setLEDColor(255, 0, 0);  // Red: Initializing
-}
-
-void ledWaitingGPS() {
-  setLEDColor(255, 165, 0);  // Orange: Waiting for GPS
-}
-
-void ledReady() {
-  setLEDColor(0, 255, 0);  // Green: Setup complete, ready
-}
-
-void ledFileSharing() {
-  setLEDColor(0, 100, 255);  // Blue: File sharing mode
-}
+// Board v1: no RGB LED — LED functions are no-ops
+void setLEDOff() {}
+void ledInitializing() {}
+void ledWaitingGPS() {}
+void ledReady() {}
+void ledFileSharing() {}
 
 // Wake the display and reset the inactivity timer.
 // Only called from the main loop (loop() context) — keeps SPI access single-threaded.
@@ -445,32 +412,43 @@ void saveSettings() {
   prefs.end();
 }
 
-// Read battery voltage and calculate percentage
-int readBatteryPercent() {
-  // Take multiple samples for stability
-  long total = 0;
-  for (int i = 0; i < BATTERY_SAMPLES; i++) {
-    total += analogRead(BATTERY_PIN);
-    delay(2);
-  }
-  int avgReading = total / BATTERY_SAMPLES;
+// Board v1: no battery ADC
+int readBatteryPercent() { return 0; }
 
-  // Convert ADC reading to voltage
-  // ESP32 ADC: 12-bit (0-4095), reference 3.3V
-  float adcVoltage = (avgReading / 4095.0) * 3.3;
+// Interrupt handler for rotary encoder (fires on any A-pin edge)
+void IRAM_ATTR encoderISR() {
+  bool a = digitalRead(ENC_A_PIN);
+  bool b = digitalRead(ENC_B_PIN);
+  if (a == b) encoderDelta++;   // CW  → next field
+  else        encoderDelta--;   // CCW → prev field
+}
 
-  // Calculate actual battery voltage (accounting for voltage divider)
-  float batteryVoltage = adcVoltage * VOLTAGE_DIVIDER_RATIO;
+// Boot screen: shows hardware initialisation status on OLED.
+// Call after each init step with updated flags.
+void drawBootScreen(bool sdOk, bool sdDone, bool gpsOk) {
+  if (!ENABLE_DISPLAY_OUTPUT) return;
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_5x8_tf);
+  u8g2.drawStr(14, 8,  "SignalScout v1");
+  u8g2.drawStr(10, 16, "-- Board Test --");
+  u8g2.drawHLine(0, 18, 128);
 
-  // Calculate percentage
-  int percent = (int)(((batteryVoltage - BATTERY_EMPTY_VOLTAGE) /
-                       (BATTERY_FULL_VOLTAGE - BATTERY_EMPTY_VOLTAGE)) * 100);
+  // OLED row — always OK if we're drawing
+  u8g2.drawStr(2,  30, "Display");
+  u8g2.drawStr(74, 30, "[  OK   ]");
 
-  // Clamp to 0-100
-  if (percent < 0) percent = 0;
-  if (percent > 100) percent = 100;
+  // SD row
+  u8g2.drawStr(2,  42, "SD Card");
+  if (!sdDone)       u8g2.drawStr(74, 42, "[ INIT  ]");
+  else if (sdOk)     u8g2.drawStr(74, 42, "[  OK   ]");
+  else               u8g2.drawStr(74, 42, "[ FAIL  ]");
 
-  return percent;
+  // GPS row
+  u8g2.drawStr(2,  54, "GPS");
+  if (!gpsOk)        u8g2.drawStr(74, 54, "[ WAIT  ]");
+  else               u8g2.drawStr(74, 54, "[  OK   ]");
+
+  u8g2.sendBuffer();
 }
 
 // Generate log filename with timestamp and create/open the file
@@ -789,180 +767,127 @@ void sdLogTask(void* parameter) {
 
 void setup() {
   Serial.begin(115200);
-  delay(1000);
+  delay(500);
 
-  // Initialize status LED first
-  statusLED.begin();
-  statusLED.setBrightness(100);  // Set brightness (0-255)
-  ledInitializing();  // Red: Starting initialization
-
-  consolePrintln("\n\n=== BOOT START ===");
+  consolePrintln("\n\n=== BOOT START (Board v1) ===");
   consolePrintln("SignalScout - WiFi & Bluetooth Scanner with GPS");
-  consolePrintln("=========================================================");
 
-  // Create FreeRTOS mutexes and queue
-  consolePrintln("\n[0/7] Initializing FreeRTOS resources...");
+  // ── Step 0: Shared SPI bus init (SD + OLED share GPIO 8/10) ──────────────
+  // Must happen before OLED begin() so u8g2 HW SPI uses the correct pins.
+  SPI.begin(SD_SCK, SD_MISO, SD_MOSI);
+  delay(100);
+
+  // ── Step 1: OLED first — so we can show a boot status screen ─────────────
+  consolePrintln("[1/6] Initializing OLED display...");
+  if (ENABLE_DISPLAY_OUTPUT) {
+    if (!u8g2.begin()) {
+      consolePrintln("ERROR: u8g2 display init failed!");
+    } else {
+      consolePrintln("Display initialized");
+    }
+  }
+  drawBootScreen(false, false, false);  // Show initial state before SD attempt
+
+  // ── Step 2: FreeRTOS resources ────────────────────────────────────────────
+  consolePrintln("[2/6] Initializing FreeRTOS resources...");
   deviceMapMutex = xSemaphoreCreateMutex();
   sdCardMutex = xSemaphoreCreateMutex();
   logQueue = xQueueCreate(LOG_QUEUE_SIZE, sizeof(LogEntry));
-
   if (deviceMapMutex == NULL || sdCardMutex == NULL || logQueue == NULL) {
     consolePrintln("ERROR: Failed to create FreeRTOS resources!");
-    while(1);  // Halt
+    while(1);
   }
-  consolePrintln("FreeRTOS mutexes and queue created successfully");
+  consolePrintln("FreeRTOS mutexes and queue created");
 
-  // Initialize mode button
-  pinMode(SHARE_BUTTON_PIN, INPUT_PULLUP);  // Active LOW with internal pullup
-  consolePrintln("Mode button initialized (GPIO23)");
+  // ── Step 3: Rotary encoder ────────────────────────────────────────────────
+  consolePrintln("[3/6] Initializing rotary encoder...");
+  pinMode(ENC_A_PIN,  INPUT);  // External pull-ups on PCB
+  pinMode(ENC_B_PIN,  INPUT);
+  pinMode(ENC_SW_PIN, INPUT);  // External pull-up on PCB
+  attachInterrupt(digitalPinToInterrupt(ENC_A_PIN), encoderISR, CHANGE);
+  consolePrintln("Encoder initialized (A=GPIO1, B=GPIO2, SW=GPIO12)");
 
-  // ============================================
-  // CRITICAL: Initialize SD card FIRST before any radio initialization
-  // The BLE radio can interfere with SPI if initialized first
-  // ============================================
-  consolePrintln("\n[1/7] Initializing SD card (SPI)...");
+  // ── Step 4: SD card ───────────────────────────────────────────────────────
+  consolePrintln("[4/6] Initializing SD card (SPI, shared bus)...");
   if (ENABLE_LOG_OUTPUT) {
-    consolePrintf("SD Card pins: CS=%d, MOSI=%d, MISO=%d, SCK=%d\n", SD_CS, SD_MOSI, SD_MISO, SD_SCK);
+    consolePrintf("SD pins: CS=%d, MOSI=%d, MISO=%d, SCK=%d\n", SD_CS, SD_MOSI, SD_MISO, SD_SCK);
 
-    // Initialize SPI bus for SD card
-    SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
-    delay(250);  // Longer delay for SPI to stabilize
-
-    // Try to mount SD card with retries at different speeds
-    int retries = 5;
-    uint32_t spiSpeeds[] = {1000000, 2000000, 4000000, 8000000};  // Try different speeds
-    int speedIndex = 0;
+    uint32_t spiSpeeds[] = {1000000, 2000000, 4000000, 8000000};
+    int retries = 5, speedIndex = 0;
 
     while (retries > 0 && !sdCardMounted) {
-      uint32_t currentSpeed = spiSpeeds[speedIndex % 4];
-      consolePrintf("Attempting SD card mount at %lu Hz (attempt %d/%d)...\n",
-                    currentSpeed, (6 - retries), 5);
-
-      if (SD.begin(SD_CS, SPI, currentSpeed, "/sd", 5, false)) {
-        sdCardMounted = true;
-        consolePrintf("SD Card mounted successfully at %lu Hz\n", currentSpeed);
-
-        // Verify we can actually write to the card
+      uint32_t spd = spiSpeeds[speedIndex % 4];
+      consolePrintf("Trying SD at %lu Hz (attempt %d/5)...\n", spd, 6 - retries);
+      if (SD.begin(SD_CS, SPI, spd, "/sd", 5, false)) {
         File testFile = SD.open("/test.tmp", FILE_WRITE);
         if (testFile) {
           testFile.println("test");
           testFile.close();
           SD.remove("/test.tmp");
-          consolePrintln("SD Card write test passed");
+          sdCardMounted = true;
+          consolePrintf("SD mounted at %lu Hz\n", spd);
         } else {
-          consolePrintln("WARNING: SD Card write test failed");
-          sdCardMounted = false;
+          consolePrintln("WARNING: SD write test failed");
           SD.end();
-        }
-      } else {
-        retries--;
-        speedIndex++;
-        if (retries > 0) {
-          consolePrintf("SD Card mount failed, retrying with different settings... (%d attempts left)\n", retries);
-          SD.end();
-          delay(500);
         }
       }
+      if (!sdCardMounted) { retries--; speedIndex++; SD.end(); delay(500); }
     }
-
-    if (!sdCardMounted) {
-      consolePrintln("ERROR: SD Card initialization failed after all retries!");
-      consolePrintln("Check:");
-      consolePrintln("  1) Card inserted and seated properly?");
-      consolePrintln("  2) Card formatted as FAT32?");
-      consolePrintln("  3) Wiring: CS->2, MOSI->3, MISO->1, SCK->0");
-      consolePrintln("  4) Card not corrupted or damaged?");
-      consolePrintln("Continuing without SD logging...");
-    }
+    if (!sdCardMounted) consolePrintln("SD init failed — continuing without logging");
   } else {
     consolePrintln("SD logging disabled in config");
   }
+  drawBootScreen(sdCardMounted, true, false);  // SD result now known
 
-  // Initialize battery ADC
-  consolePrintln("\n[2/7] Initializing battery monitor...");
-  analogReadResolution(12);  // 12-bit resolution
-  analogSetAttenuation(ADC_11db);  // Full range 0-3.3V
-  batteryPercent = readBatteryPercent();
-  consolePrintf("Battery level: %d%%\n", batteryPercent);
-
-  // Check RTC time on boot
-  consolePrintln("\n[3/7] Checking RTC time...");
+  // ── Step 5: RTC + GPS UART ────────────────────────────────────────────────
+  consolePrintln("[5/6] Checking RTC + starting GPS UART...");
   if (rtc.getYear() > 2020) {
-    consolePrintf("RTC time found: %04d-%02d-%02d %02d:%02d:%02d\n",
-                  rtc.getYear(), rtc.getMonth() + 1, rtc.getDay(),
+    consolePrintf("RTC: %04d-%02d-%02d %02d:%02d:%02d\n",
+                  rtc.getYear(), rtc.getMonth()+1, rtc.getDay(),
                   rtc.getHour(true), rtc.getMinute(), rtc.getSecond());
   } else {
     consolePrintln("No valid RTC time stored");
   }
-
-  // Initialize OLED Display
-  consolePrintln("\n[4/7] Initializing OLED display...");
-  if (ENABLE_DISPLAY_OUTPUT) {
-    if (!u8g2.begin()) {
-      consolePrintln("ERROR: u8g2 display init failed!");
-      consolePrintln("Continuing without display...");
-    } else {
-      u8g2.clearBuffer();
-      u8g2.setFont(u8g2_font_5x8_tf);
-      u8g2.drawStr(0, FONT_SM_ASCENT, "Initializing...");
-      u8g2.sendBuffer();
-      consolePrintln("Display initialized");
-    }
-  } else {
-    consolePrintln("Display disabled in config");
-  }
-
-  // Initialize GPS
-  consolePrintln("\n[5/7] Initializing GPS...");
   gpsSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX, GPS_TX);
-  consolePrintln("GPS UART initialized");
+  consolePrintf("GPS UART started (RX=GPIO%d, TX=GPIO%d)\n", GPS_RX, GPS_TX);
 
-  // Load persisted scan settings from NVS
-  consolePrintln("\n[5b/7] Loading saved settings...");
+  // ── Step 6: Load settings + watchdog ─────────────────────────────────────
+  consolePrintln("[6/6] Loading saved settings...");
   loadSettings();
 
-  // WiFi initialized per-cycle by unifiedScanTask (not here — scan task owns the radio)
-  consolePrintln("\n[6/7] WiFi deferred to scan task");
-
-  // Skip BLE initialization on boot - it will be initialized by the unified scan task
-  consolePrintln("Skipping BLE init (will initialize when scan task starts)");
-  consolePrintln("\n[7/7] Skipped - BLE deferred to scan task");
-
-  // Reconfigure task watchdog with longer timeout to prevent async_tcp triggers
   esp_task_wdt_config_t wdt_config = {
     .timeout_ms = 30000,
     .idle_core_mask = 0,
     .trigger_panic = false
   };
   esp_task_wdt_reconfigure(&wdt_config);
-  consolePrintln("Task watchdog reconfigured (30s timeout, no panic)");
+  consolePrintln("Task watchdog reconfigured (30s, no panic)");
+  consolePrintln("=== INIT COMPLETE ===");
 
-  consolePrintln("\n=== INITIALIZATION COMPLETE ===");
-
-  // Boot-time mode selection: show a 2-second window for the user to hold the button.
-  // Holding at power-on (or immediately after) selects file sharing mode.
-  // Releasing or not pressing selects scan mode (default).
+  // ── Boot mode selection: hold encoder button for file-share mode ──────────
+  // Show 2-second window; boot screen remains visible during this time.
   if (ENABLE_DISPLAY_OUTPUT) {
     u8g2.clearBuffer();
     u8g2.setFont(u8g2_font_5x8_tf);
-    u8g2.drawStr(2, 6, "SignalScout");
-    u8g2.drawStr(2, 22, "Hold btn: file share");
-    u8g2.drawStr(2, 38, "Release:  scan mode");
+    u8g2.drawStr(2,  8, "SignalScout v1");
+    u8g2.drawHLine(0, 10, 128);
+    u8g2.drawStr(2, 22, "Hold enc btn:");
+    u8g2.drawStr(2, 32, "  file share mode");
+    u8g2.drawStr(2, 44, "Release:");
+    u8g2.drawStr(2, 54, "  scan mode (default)");
     u8g2.sendBuffer();
   }
   delay(2000);
 
-  if (digitalRead(SHARE_BUTTON_PIN) == LOW) {
-    consolePrintln("Button held at boot - entering FILE SHARING mode");
-    // Wait for button release so it doesn't accidentally trigger anything else
-    while (digitalRead(SHARE_BUTTON_PIN) == LOW) delay(50);
-    buttonPressed = false;
+  if (digitalRead(ENC_SW_PIN) == LOW) {
+    consolePrintln("Encoder button held — entering FILE SHARING mode");
+    while (digitalRead(ENC_SW_PIN) == LOW) delay(50);
+    encSwPressed = false;
     enterFileSharingMode();
   } else {
-    consolePrintln("Entering SCAN mode (default) - waiting for GPS...\n");
+    consolePrintln("Entering SCAN mode — waiting for GPS...");
     scanMode = true;
     gpsWaitStart = millis();
-    ledWaitingGPS();  // Orange: waiting for GPS
   }
 }
 
@@ -1047,12 +972,6 @@ void loop() {
     }
   }
 
-  // Update battery reading periodically
-  if (currentTime - lastBatteryRead >= BATTERY_READ_INTERVAL) {
-    batteryPercent = readBatteryPercent();
-    lastBatteryRead = currentTime;
-  }
-
   // Display off timer: sleep/wake based on inactivity.
   // Scan tasks signal a wake by writing lastDisplayActivityMs (atomic 32-bit write).
   if (ENABLE_DISPLAY_OUTPUT && dispTimerMs[displayTimerIdx] > 0) {
@@ -1083,40 +1002,45 @@ void loop() {
     lastDisplayUpdate = currentTime;
   }
 
-  // Mode button (SHARE_BUTTON_PIN on GPIO23)
-  // In scan mode: hold 1s to pause (flush SD, safe to power off); hold again to resume.
-  // Mode is selected at boot - no mid-session switching.
-  bool shareButtonState = (digitalRead(SHARE_BUTTON_PIN) == LOW);
+  // ── Rotary encoder: rotation ──────────────────────────────────────────────
+  // encoderDelta is written by ISR; read atomically here and reset.
+  int8_t delta = encoderDelta;
+  if (delta != 0) {
+    encoderDelta = 0;
+    wakeDisplay();
+    if (scanMode && scanPaused) {
+      if (delta > 0) {
+        mui_NextField(&mui);
+      } else {
+        mui_PrevField(&mui);
+      }
+      updateDisplayPaused();
+    }
+  }
 
-  if (shareButtonState && !buttonPressed) {
-    buttonPressed = true;
-    buttonPressStart = currentTime;
-    wakeDisplay();  // Any button press wakes the display
-  } else if (!shareButtonState && buttonPressed) {
-    unsigned long holdDuration = currentTime - buttonPressStart;
-    bool tapDetected  = (holdDuration < SHARE_HOLD_TIME);
-    bool holdDetected = (holdDuration >= SHARE_HOLD_TIME);
+  // ── Rotary encoder: button (ENC_SW active-LOW) ────────────────────────────
+  bool encSwState = (digitalRead(ENC_SW_PIN) == LOW);
+  if (encSwState && !encSwPressed) {
+    encSwPressed = true;
+    encSwPressStart = currentTime;
+    wakeDisplay();
+  } else if (!encSwState && encSwPressed) {
+    unsigned long holdDuration = currentTime - encSwPressStart;
+    bool tapDetected  = (holdDuration < ENC_HOLD_TIME);
+    bool holdDetected = (holdDuration >= ENC_HOLD_TIME);
     if (scanMode && scanTasksStarted) {
       if (!scanPaused) {
-        // Normal operation: long press pauses and opens settings menu
-        if (holdDetected) {
-          pauseScanning();
-        }
+        if (holdDetected) pauseScanning();
       } else {
-        // Paused / settings menu: short tap advances MUI cursor, long press activates
-        if (tapDetected) {
-          mui_NextField(&mui);
-          updateDisplayPaused();
-        } else if (holdDetected) {
+        // In menu: any press activates the focused item (rotation handles navigation)
+        if (tapDetected || holdDetected) {
           saveSettings();
           mui_SendSelect(&mui);
-          if (scanPaused) {  // Still paused (toggled a checkbox, not Resume)
-            updateDisplayPaused();
-          }
+          if (scanPaused) updateDisplayPaused();
         }
       }
     }
-    buttonPressed = false;
+    encSwPressed = false;
   }
 
   // Minimal delay to prevent tight loop but maintain responsiveness (10ms = 100Hz loop)
@@ -2506,23 +2430,7 @@ void drawStatusBar() {
     u8g2.print(dir);
   }
 
-  // Battery icon (right side): body x=108-123, tip x=124-126
-  {
-    int bx = 108, by = 1, bw = 16, bh = 9, tw = 3, th = 5;
-    u8g2.drawFrame(bx, by, bw, bh);
-    u8g2.drawBox(bx + bw, by + (bh - th) / 2, tw, th);
-    int fill = ((bw - 2) * batteryPercent) / 100;
-    if (fill < 0)      fill = 0;
-    if (fill > bw - 2) fill = bw - 2;
-    if (fill > 0)      u8g2.drawBox(bx + 1, by + 1, fill, bh - 2);
-
-    // Percentage text right-aligned to the left of the battery body
-    char pct[6];
-    snprintf(pct, sizeof(pct), "%d%%", batteryPercent);
-    int tw2 = strlen(pct) * 6;
-    u8g2.setCursor(bx - tw2 - 2, 10);
-    u8g2.print(pct);
-  }
+  // Board v1: no battery ADC — right side of status bar left blank
 
   // Separator line
   u8g2.drawHLine(0, 11, 128);
