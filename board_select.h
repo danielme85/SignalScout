@@ -1,17 +1,16 @@
 #pragma once
-// Board selector for SignalScout.
+// ============================================================
+//  BOARD SELECTION — edit this section for Arduino IDE users
+// ============================================================
+// Uncomment exactly ONE line to match your hardware.
+// Leave all commented out to use the default (SignalScout PCB v1 + XIAO C5).
 //
-// Pass exactly one -D flag at compile time to choose your hardware:
+// #define BOARD_SIGNALSCOUT_V1_C5   // Custom PCB v1 + XIAO ESP32-C5 (default)
+#define BOARD_SIGNALSCOUT_V1_C6   // Custom PCB v1 + XIAO ESP32-C6
 //
-//   -DBOARD_SIGNALSCOUT_V1_C5   Custom PCB v1 with XIAO ESP32-C5  (default)
-//   -DBOARD_SIGNALSCOUT_V1_C6   Custom PCB v1 with XIAO ESP32-C6
-//
-// Arduino IDE: add the flag under Sketch > Optimize > Custom build options,
-// or edit the #define below to match your board.
-//
-// arduino-cli / CI: pass --build-property "build.extra_flags=-DBOARD_xxx"
-//
-// If no flag is defined the C5 PCB config is used (original hardware).
+// arduino-cli / CI users: leave the lines above commented out and pass
+//   --build-property "build.extra_flags=-DBOARD_xxx"  instead.
+// ============================================================
 
 #if defined(BOARD_SIGNALSCOUT_V1_C5)
   #include "boards/signalscout_v1_c5.h"
