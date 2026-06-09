@@ -17,12 +17,21 @@ jobs:
     strategy:
       matrix:
         include:
-          # Standard ESP32-C5 dev board: 16MB flash, 8MB PSRAM
-          - name: esp32c5-16mb
+          # SignalScout Board v1 + XIAO ESP32-C5 (16MB flash variant)
+          - name: signalscout-v1-c5-16mb
             fqbn: "esp32:esp32:esp32c5:FlashSize=16M,PartitionScheme=huge_app,PSRAM=enabled"
-          # Seeed XIAO ESP32-C5: 8MB flash, 8MB PSRAM
-          - name: xiao-esp32c5-8mb
+            board_flag: "-DBOARD_SIGNALSCOUT_V1_C5"
+            chip: esp32c5
+          # SignalScout Board v1 + XIAO ESP32-C5 (8MB flash, matches Seeed XIAO module)
+          - name: signalscout-v1-c5-8mb
             fqbn: "esp32:esp32:esp32c5:FlashSize=8M,PartitionScheme=huge_app,PSRAM=enabled"
+            board_flag: "-DBOARD_SIGNALSCOUT_V1_C5"
+            chip: esp32c5
+          # SignalScout Board v1 + XIAO ESP32-C6 (8MB flash, no PSRAM)
+          - name: signalscout-v1-c6-8mb
+            fqbn: "esp32:esp32:esp32c6:FlashSize=8M,PartitionScheme=huge_app,PSRAM=disabled"
+            board_flag: "-DBOARD_SIGNALSCOUT_V1_C6"
+            chip: esp32c6
 
     steps:
       - uses: actions/checkout@v4
@@ -79,6 +88,7 @@ jobs:
         run: |
           arduino-cli compile \
             --fqbn "${{ matrix.fqbn }}" \
+            --build-property "build.extra_flags=${{ matrix.board_flag }}" \
             --export-binaries \
             --output-dir build \
             .
@@ -92,7 +102,7 @@ jobs:
       - name: Merge bootloader + partition table + app into one binary
         run: |
           pip install esptool --quiet
-          esptool.py --chip esp32c5 merge_bin \
+          esptool.py --chip ${{ matrix.chip }} merge_bin \
             --output build/SignalScout-${{ matrix.name }}-merged.bin \
             0x0     build/SignalScout.ino.bootloader.bin \
             0x8000  build/SignalScout.ino.partitions.bin \

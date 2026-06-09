@@ -1,15 +1,12 @@
 /*
- * SignalScout - WiFi and Bluetooth Scanner for ESP32-C5
- * Scans 2.4GHz and 5GHz WiFi networks and Bluetooth LE devices
+ * SignalScout - WiFi and Bluetooth Scanner for ESP32-C5 / ESP32-C6
+ * Scans 2.4GHz (and 5GHz on C5) WiFi networks and Bluetooth LE devices
  * Logs all activity to SD card over SPI with GPS timestamps and location
  * Displays status on SSD1309 OLED display
  *
- * Hardware: ESP32-C5 (16MB FLASH, 8MB PSRAM) or Seeed XIAO ESP32-C5 (8MB FLASH, 8MB PSRAM)
- * SD Card: Connected via SPI
- * GPS: NEO-6M connected via UART (TX/RX)
- * OLED: SSD1309 128x64 connected via SPI
- * RGB LED: WS2812B on GPIO27 for status indication
- * Battery: 3.7V LiPo with voltage divider on GPIO6
+ * Supported hardware (select via -DBOARD_xxx build flag — see board_select.h):
+ *   BOARD_SIGNALSCOUT_V1_C5  Custom PCB v1 + XIAO ESP32-C5  (default)
+ *   BOARD_SIGNALSCOUT_V1_C6  Custom PCB v1 + XIAO ESP32-C6
  */
 
 #include <WiFi.h>
@@ -30,42 +27,17 @@
 #include <esp_task_wdt.h>
 #include <stdarg.h>
 #include "secrets.h"
+#include "board_select.h"  // Pin definitions and capability flags for the target board
 // File sharing via WiFi (install ESPAsyncWebServer and AsyncTCP libraries)
 #include <ESPAsyncWebServer.h>
 #include <Preferences.h>    // NVS key-value store for persisting settings
 
-// === Board v1 PCB Pinout ===
-// SD Card and OLED share the same SPI bus (GPIO 8/10)
-
-// SD Card SPI Pins
-#define SD_CS    4   // Chip Select (D3)
-#define SD_MOSI  10  // MOSI — shared with OLED (D10)
-#define SD_MISO  9   // MISO (D9)
-#define SD_SCK   8   // SCK — shared with OLED (D8)
-
-// GPS UART Pins
-#define GPS_RX   6   // ESP32 RX ← GPS TX (D6)
-#define GPS_TX   7   // ESP32 TX → GPS RX (D7)
-#define GPS_BAUD 9600
-
-// OLED Display SPI Pins (shares bus with SD card)
-#define OLED_DC    3              // Data/Command (D2)
-#define OLED_CS    11             // Chip Select (D4)
-#define OLED_RESET U8X8_PIN_NONE  // RST tied to 3V3 on PCB — no GPIO needed
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 
 // Font baseline offsets for u8g2 (y-as-baseline vs Adafruit y-as-top-left)
 #define FONT_SM_ASCENT 6   // u8g2_font_5x8_tf  ascent above baseline
 #define FONT_LG_ASCENT 14  // u8g2_font_10x20_tf ascent above baseline
-
-// Rotary Encoder Pins (replaces single mode button)
-#define ENC_A_PIN    1     // Encoder A / CLK (D0) — external 10k pull-up + 10nF debounce on PCB
-#define ENC_B_PIN    2     // Encoder B / DT  (D1) — external 10k pull-up + 10nF debounce on PCB
-#define ENC_SW_PIN   12    // Encoder switch  (D5) — external 10k pull-up on PCB
-#define ENC_HOLD_TIME 1000 // Hold for 1 second to trigger action (ms)
-
-// Board v1 has no RGB LED and no battery ADC — both features disabled
 
 // Scan settings
 #define SCAN_INTERVAL 10  // WiFi and BLE scan every x seconds
