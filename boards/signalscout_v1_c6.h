@@ -49,3 +49,5 @@
 #define HAS_NEOPIXEL       0  // no RGB LED on v1 PCB
 #define HAS_BATTERY_ADC    0  // no voltage divider on v1 PCB
 #define HAS_DUAL_BAND_WIFI 0  // ESP32-C6 is 2.4 GHz only; 5 GHz channels will not appear
+#define HAS_FILE_SERVER    0  // ESPAsyncWebServer does not support ESP32-C6 yet
+#define HAS_BLE            1  // BLE supported on C6

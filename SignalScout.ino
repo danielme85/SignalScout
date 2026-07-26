@@ -9,12 +9,18 @@
  *   BOARD_SIGNALSCOUT_V1_C6  Custom PCB v1 + XIAO ESP32-C6
  */
 
+// Board selection MUST come first — defines HAS_BLE, HAS_NEOPIXEL, HAS_FILE_SERVER, etc.
+#include "secrets.h"
+#include "board_select.h"
+
 #include <WiFi.h>
 #include <esp_wifi.h>
+#if HAS_BLE
 #include <BLEDevice.h>
 #include <BLEUtils.h>
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
+#endif
 #include <SD.h>
 #include <SPI.h>
 #include <TinyGPSPlus.h>
@@ -23,13 +29,15 @@
 #include <clib/mui.h>
 #include <clib/mui_u8g2.h>
 #include <ESP32Time.h>
+#if HAS_NEOPIXEL
 #include <Adafruit_NeoPixel.h>
+#endif
 #include <esp_task_wdt.h>
 #include <stdarg.h>
-#include "secrets.h"
-#include "board_select.h"  // Pin definitions and capability flags for the target board
+#if HAS_FILE_SERVER
 // File sharing via WiFi (install ESPAsyncWebServer and AsyncTCP libraries)
 #include <ESPAsyncWebServer.h>
+#endif
 #include <Preferences.h>    // NVS key-value store for persisting settings
 
 #define SCREEN_WIDTH 128
@@ -250,8 +258,10 @@ Preferences prefs;        // NVS key-value store for settings persistence
 unsigned long gpsWaitStart = 0; // When GPS wait began (for elapsed time display)
 int gpsWaitDotCount = 0;        // Dot animation counter for GPS wait console output
 String fileSharingIP;
+#if HAS_FILE_SERVER
 AsyncWebServer server(80);
 bool serverRoutesConfigured = false;
+#endif
 
 // WiFi logo animation state (0 = dot only, 1-3 = number of rings)
 int wifiAnimationState = 0;
@@ -261,6 +271,7 @@ volatile int8_t encoderDelta = 0;   // Accumulated rotation ticks (ISR-written)
 unsigned long encSwPressStart = 0;
 bool encSwPressed = false;
 
+#if HAS_BLE
 BLEScan* pBLEScan;
 
 // BLE Scan callback class - single static instance to avoid memory leak
@@ -270,6 +281,7 @@ class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
   }
 };
 static MyAdvertisedDeviceCallbacks bleCallbacks;  // Single instance, reused every scan
+#endif
 
 // Helper function to sanitize strings (remove non-printable ASCII and control characters)
 String sanitizeString(const String& input) {
@@ -585,6 +597,7 @@ void unifiedScanTask(void* parameter) {
       }
     }
 
+#if HAS_BLE
     // ===== BLE SCAN =====
     if (enableBleScan) {
       consolePrintln("\n[BLE] Scanning...");
@@ -622,6 +635,7 @@ void unifiedScanTask(void* parameter) {
       pBLEScan = NULL;
       delay(300);
     }
+#endif
 
     unsigned long cycleDuration = millis() - cycleStart;
 
@@ -1107,6 +1121,8 @@ void htmlEscapeFilename(const char* src, char* dst, size_t dstSize) {
   dst[out] = '\0';
 }
 
+#if HAS_FILE_SERVER
+
 // Files per page in web file browser
 #define FILES_PER_PAGE 20
 
@@ -1553,6 +1569,7 @@ void enterFileSharingMode() {
   if (unifiedScanTaskHandle != NULL) vTaskSuspend(unifiedScanTaskHandle);
   if (sdLogTaskHandle != NULL) vTaskSuspend(sdLogTaskHandle);
 
+#if HAS_BLE
   // Deinitialize BLE to free up 2.4GHz radio for WiFi (if it was initialized)
   // BLE and WiFi share radio resources on ESP32-C5
   // The unified scan task releases radios after each scan, but we double-check here
@@ -1562,6 +1579,7 @@ void enterFileSharingMode() {
     pBLEScan = NULL;          // Mark as deinitialized
     delay(500);  // Allow BLE to fully release radio (increased for ESP32-C5)
   }
+#endif
 
   // Connect to WiFi using credentials from secrets.h
   // Full WiFi radio reset sequence for ESP32-C5 shared radio
@@ -1730,6 +1748,35 @@ void exitFileSharingMode() {
   consolePrintln("File sharing mode exited, WiFi radio released");
 }
 
+void updateDisplayFileSharing() {
+  if (!ENABLE_DISPLAY_OUTPUT) return;
+  u8g2.clearBuffer();
+  drawStatusBar();
+  u8g2.setFont(u8g2_font_10x20_tf);
+  u8g2.drawStr(2, 12 + FONT_LG_ASCENT, "FILE SHARE");
+  u8g2.setFont(u8g2_font_5x8_tf);
+  {
+    char ipBuf[40];
+    snprintf(ipBuf, sizeof(ipBuf), "IP: %s", fileSharingIP.c_str());
+    u8g2.drawStr(2, 38, ipBuf);
+  }
+  u8g2.drawStr(2, 48, "Power off when done");
+  u8g2.drawStr(2, 57, "Boot normally: scan");
+  u8g2.sendBuffer();
+}
+
+#else  // !HAS_FILE_SERVER — stubs so the rest of the sketch compiles unchanged
+
+void enterFileSharingMode() {
+  consolePrintln("File sharing not supported on this board — entering scan mode");
+  scanMode = true;
+  gpsWaitStart = millis();
+}
+void exitFileSharingMode() {}
+void updateDisplayFileSharing() {}
+
+#endif  // HAS_FILE_SERVER
+
 
 // Create log file and FreeRTOS scan/log tasks. Called once when GPS first locks.
 void startScanTasks() {
@@ -1803,23 +1850,6 @@ void startScanTasks() {
   consolePrintln("Scan tasks started!\n");
 }
 
-
-void updateDisplayFileSharing() {
-  if (!ENABLE_DISPLAY_OUTPUT) return;
-  u8g2.clearBuffer();
-  drawStatusBar();
-  u8g2.setFont(u8g2_font_10x20_tf);
-  u8g2.drawStr(2, 12 + FONT_LG_ASCENT, "FILE SHARE");  // baseline y=26
-  u8g2.setFont(u8g2_font_5x8_tf);
-  {
-    char ipBuf[40];
-    snprintf(ipBuf, sizeof(ipBuf), "IP: %s", fileSharingIP.c_str());
-    u8g2.drawStr(2, 38, ipBuf);
-  }
-  u8g2.drawStr(2, 48, "Power off when done");
-  u8g2.drawStr(2, 57, "Boot normally: scan");
-  u8g2.sendBuffer();
-}
 
 void updateDisplayGPSWait() {
   gpsWaitDotCount = (gpsWaitDotCount + 1) % 4;
@@ -2112,6 +2142,7 @@ bool scanWiFi() {
   return true;
 }
 
+#if HAS_BLE
 void scanBluetooth() {
   consolePrintln("\n--- Bluetooth Scan Starting ---");
 
@@ -2231,6 +2262,7 @@ void scanBluetooth() {
 
   consolePrintln("--- Bluetooth Scan Complete ---\n");
 }
+#endif  // HAS_BLE
 
 void logToFile(String message) {
   if (!ENABLE_LOG_OUTPUT || !sdCardMounted || !logFileReady) return;

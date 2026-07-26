@@ -29,3 +29,5 @@
 #define HAS_NEOPIXEL       0  // no RGB LED on v1 PCB
 #define HAS_BATTERY_ADC    0  // no voltage divider on v1 PCB
 #define HAS_DUAL_BAND_WIFI 1  // ESP32-C5 supports 2.4 GHz + 5 GHz
+#define HAS_FILE_SERVER    1  // ESPAsyncWebServer supported on C5
+#define HAS_BLE            1  // BLE supported on C5
