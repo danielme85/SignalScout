@@ -10,6 +10,8 @@
 
 SignalScout is a wardriving and wireless reconnaissance tool that scans 2.4GHz and 5GHz WiFi networks and Bluetooth Low Energy (BLE) devices, logging everything to an SD card with precise GPS coordinates and timestamps.
 
+> 🙏 PCBs for this project sponsored by [PCBWay](https://www.pcbway.com).
+
 ## Features
 
 - 📶 Dual-band WiFi scanning (2.4GHz & 5GHz)
